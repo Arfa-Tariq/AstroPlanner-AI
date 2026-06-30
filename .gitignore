@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AstroPlanner data folder: keep the shared test fixture, ignore everything else
+data/*
+!data/current_request.json
