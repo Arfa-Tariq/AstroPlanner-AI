@@ -6,6 +6,16 @@ This module holds every schema reused across the project's notebooks
 classes in each notebook, so there is exactly one source of truth for
 the data shapes that flow between Weather, Visibility, Recommendation,
 FoV, and the LLM chatbot layer.
+
+v2 additions (kept optional/backward-compatible so existing fixtures
+like data/current_request.json and notebooks 02/03 keep working
+unchanged):
+    - Preferences (observation mode + favorite target categories),
+      consumed starting with the Phase 4 Recommendation Engine notebook.
+    - TelescopeType / CameraType on the equipment specs, consumed
+      starting with the Phase 5 Field-of-View Analyzer notebook.
+    - MountSpec.tracking, an additional capability flag alongside the
+      existing goto_capable.
 """
 
 from datetime import date as date_type, timedelta
@@ -29,6 +39,73 @@ class ExperienceLevel(str, Enum):
     advanced = "advanced"
 
 
+class ObservationMode(str, Enum):
+    """
+    Whether the user is primarily observing visually (through the eyepiece)
+    or imaging (astrophotography). Used by the Recommendation Engine to
+    weight targets differently — e.g. visual observers favor bright,
+    high-contrast targets; imagers favor targets that suit their FoV and
+    can tolerate longer integration times.
+    """
+    visual = "visual"
+    astrophotography = "astrophotography"
+
+
+class TargetType(str, Enum):
+    """
+    Broad celestial object categories a user can mark as a favorite.
+    Used by the Recommendation Engine (Phase 4) to boost or filter
+    candidate targets according to user interest, on top of the
+    visibility/equipment/weather-based ranking.
+    """
+    planet = "planet"
+    moon = "moon"
+    galaxy = "galaxy"
+    nebula = "nebula"
+    open_cluster = "open_cluster"
+    globular_cluster = "globular_cluster"
+    double_star = "double_star"
+
+
+class Preferences(BaseModel):
+    """
+    Soft preferences layered on top of the user's hard equipment/location
+    constraints. Not consumed by the Weather Intelligence (02) or
+    Celestial Visibility (03) notebooks — those only need location and
+    aperture. Reserved for the Recommendation Engine (Phase 4), which
+    ranks/filters targets according to mode and favorite_targets.
+    """
+    mode: ObservationMode = Field(
+        ...,
+        description=(
+            "Primary use case for this session: visual observing or "
+            "astrophotography. Drives how the Recommendation Engine "
+            "weights target brightness vs. imaging suitability."
+        ),
+    )
+    favorite_targets: list[TargetType] = Field(
+        default_factory=list,
+        description=(
+            "Celestial object categories the user is most interested in. "
+            "Empty list means no preference — all categories are weighted "
+            "equally by the Recommendation Engine."
+        ),
+    )
+
+
+class TelescopeType(str, Enum):
+    """
+    Optical design of the telescope. Reserved for the Field-of-View
+    Analyzer (Phase 5), where design affects central obstruction and
+    illumination/vignetting across the sensor, and for the Recommendation
+    Engine, where design affects suitability for planetary vs. deep-sky
+    targets (e.g. long-focal-ratio refractors vs. fast reflectors).
+    """
+    refractor = "refractor"
+    reflector = "reflector"
+    catadioptric = "catadioptric"
+
+
 class TelescopeSpec(BaseModel):
     """
     Optical specifications of the user's telescope.
@@ -40,6 +117,16 @@ class TelescopeSpec(BaseModel):
        how faint an object the telescope can usefully observe, which feeds
        into the Recommendation Engine's target ranking.
     """
+    type: Optional[TelescopeType] = Field(
+        default=None,
+        description=(
+            "Optical design: 'refractor', 'reflector', or 'catadioptric'. "
+            "Optional — left None if the user doesn't know or it isn't "
+            "collected yet. Not currently consumed by the Weather or "
+            "Visibility notebooks; reserved for the FoV Analyzer and "
+            "Recommendation Engine."
+        ),
+    )
     aperture_mm: float = Field(
         ...,
         description=(
@@ -74,6 +161,18 @@ class TelescopeSpec(BaseModel):
     )
 
 
+class CameraType(str, Enum):
+    """
+    Camera hardware category. Reserved for the FoV Analyzer and
+    astrophotography acquisition recommendations (e.g. dedicated astro
+    cameras support cooling/gain settings that DSLRs/mirrorless bodies
+    don't expose the same way).
+    """
+    dslr = "dslr"
+    mirrorless = "mirrorless"
+    dedicated_astro = "dedicated_astro"
+
+
 class CameraSpec(BaseModel):
     """
     Imaging sensor specifications for the user's astrophotography camera.
@@ -82,6 +181,14 @@ class CameraSpec(BaseModel):
     Analyzer, which determines whether a given celestial target will fit
     perfectly, be too large, or be too small in a single frame.
     """
+    type: Optional[CameraType] = Field(
+        default=None,
+        description=(
+            "Camera hardware category: 'dslr', 'mirrorless', or "
+            "'dedicated_astro'. Optional — left None if not collected yet. "
+            "Reserved for the FoV Analyzer and acquisition recommendations."
+        ),
+    )
     sensor_width_mm: float = Field(
         ...,
         description="Physical width of the camera's image sensor, in millimeters. Realistic range: 4mm-50mm.",
@@ -108,6 +215,17 @@ class CameraSpec(BaseModel):
     )
 
 
+class MountType(str, Enum):
+    """
+    Mount type. Kept as an enum (rather than a free string) so invalid
+    values are rejected at the schema layer instead of downstream.
+    Values are unchanged from the original string field, so existing
+    fixtures with type: "alt-az" / "equatorial" continue to validate.
+    """
+    alt_az = "alt-az"
+    equatorial = "equatorial"
+
+
 class MountSpec(BaseModel):
     """
     Specifications of the telescope mount, which governs tracking accuracy
@@ -116,7 +234,7 @@ class MountSpec(BaseModel):
     goto_capable in particular affects the Recommendation Engine: non-GoTo
     mounts may warrant simpler, easier-to-locate targets for beginners.
     """
-    type: str = Field(
+    type: MountType = Field(
         ...,
         description=(
             "Mount type: 'alt-az' or 'equatorial'. Equatorial mounts can "
@@ -133,6 +251,15 @@ class MountSpec(BaseModel):
             "instructions need to be."
         ),
     )
+    tracking: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether the mount has motorized sidereal tracking at all "
+            "(independent of goto_capable — a mount can track without being "
+            "goto-capable). Optional — left None if not collected yet. "
+            "Relevant for astrophotography exposure-length recommendations."
+        ),
+    )
 
 
 class UserProfile(BaseModel):
@@ -141,8 +268,8 @@ class UserProfile(BaseModel):
     level, and equipment. This is the core identity object reused across
     every downstream module: Weather Intelligence (uses location), Celestial
     Visibility Engine (uses location), Recommendation Engine (uses
-    experience_level + equipment), and Field-of-View Analyzer (uses telescope
-    + camera).
+    experience_level + equipment + preferences), and Field-of-View Analyzer
+    (uses telescope + camera).
     """
     name: str = Field(..., description="Display name of the user.")
     latitude: float = Field(
@@ -168,6 +295,15 @@ class UserProfile(BaseModel):
     experience_level: ExperienceLevel = Field(
         ...,
         description="See ExperienceLevel; used to tailor target difficulty and explanation depth.",
+    )
+    preferences: Optional[Preferences] = Field(
+        default=None,
+        description=(
+            "Optional soft preferences (observation mode + favorite target "
+            "categories). Left None if not collected. Not consumed by "
+            "Weather Intelligence or Celestial Visibility — reserved for "
+            "the Recommendation Engine."
+        ),
     )
     telescope: TelescopeSpec = Field(
         ..., description="The user's primary telescope specifications."
