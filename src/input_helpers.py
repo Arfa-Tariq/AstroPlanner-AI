@@ -5,6 +5,11 @@ Validated, retry-on-bad-input prompt functions used to collect a
 WeeklyPlanRequest from the terminal (Colab cell input()). Kept separate
 from models.py so a future frontend can replace this file entirely without
 touching the schemas it produces.
+
+v2: adds prompts for the new (optional) Preferences block and the new
+(optional) telescope/camera type + mount tracking fields, on top of the
+original validation helpers — nothing about the original retry/sanitize
+behavior was weakened.
 """
 
 import re
@@ -50,6 +55,34 @@ def prompt_yes_no(label: str) -> bool:
         if raw in ("n", "no"):
             return False
         print("  Please enter y or n.")
+
+
+def prompt_multi_choice(label: str, choices: list[str]) -> list[str]:
+    """
+    Displays a numbered list and lets the user pick zero or more entries by
+    comma-separated index (e.g. '1,3,4'). Unlike the single-value prompts
+    above, this one is intentionally forgiving: it silently drops
+    unparseable or out-of-range entries and de-duplicates rather than
+    looping forever, since this field is optional/exploratory (favorite
+    target categories) rather than a required, structured value.
+    """
+    print(f"{label}:")
+    for i, choice in enumerate(choices, 1):
+        print(f"  {i}. {choice}")
+    raw = input("Enter numbers separated by commas (or press Enter to skip): ").strip()
+    if not raw:
+        return []
+
+    selected = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part.isdigit():
+            continue
+        idx = int(part) - 1
+        if 0 <= idx < len(choices):
+            selected.append(choices[idx])
+
+    return list(dict.fromkeys(selected))  # de-dupe, preserve order
 
 
 def sanitize_free_text(raw: str, max_len: int = 300) -> str:
@@ -108,17 +141,44 @@ def collect_weekly_plan_request_cli() -> WeeklyPlanRequest:
         },
     }
 
+    if prompt_yes_no("Do you know your telescope's optical design?"):
+        raw["user"]["telescope"]["type"] = prompt_choice(
+            "Telescope type", ["refractor", "reflector", "catadioptric"]
+        )
+
+    if prompt_yes_no("Set observing preferences (mode + favorite targets)?"):
+        raw["user"]["preferences"] = {
+            "mode": prompt_choice("Observation mode", ["visual", "astrophotography"]),
+            "favorite_targets": prompt_multi_choice(
+                "Preferred target categories",
+                [
+                    "planet",
+                    "moon",
+                    "galaxy",
+                    "nebula",
+                    "open_cluster",
+                    "globular_cluster",
+                    "double_star",
+                ],
+            ),
+        }
+
     if prompt_yes_no("Do you have a camera for imaging?"):
         raw["user"]["camera"] = {
             "sensor_width_mm": prompt_float("Sensor width (mm)", 4, 50),
             "sensor_height_mm": prompt_float("Sensor height (mm)", 4, 50),
             "pixel_size_um": prompt_float("Pixel size (µm)", 1, 15),
         }
+        if prompt_yes_no("Do you know your camera type?"):
+            raw["user"]["camera"]["type"] = prompt_choice(
+                "Camera type", ["dslr", "mirrorless", "dedicated_astro"]
+            )
 
     if prompt_yes_no("Do you know your mount type?"):
         raw["user"]["mount"] = {
             "type": prompt_choice("Mount type", ["alt-az", "equatorial"]),
             "goto_capable": prompt_yes_no("GoTo capable?"),
+            "tracking": prompt_yes_no("Motorized tracking capable?"),
         }
 
     notes_raw = input("Notes (optional, press Enter to skip): ")
