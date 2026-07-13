@@ -296,6 +296,20 @@ class UserProfile(BaseModel):
         ...,
         description="See ExperienceLevel; used to tailor target difficulty and explanation depth.",
     )
+    bortle_scale: Optional[int] = Field(
+        default=None,
+        description=(
+            "Self-reported Bortle dark-sky scale for the observing site, "
+            "1 (excellent dark sky) to 9 (inner-city sky). A static site "
+            "property, like latitude/longitude, rather than a nightly "
+            "value — collected once here instead of fetched per-night. "
+            "Optional; if None, the Recommendation Engine (Phase 4) falls "
+            "back to an automatic lat/lon-based lookup, and drops the "
+            "light-pollution factor entirely if that also fails."
+        ),
+        ge=1,
+        le=9,
+    )
     preferences: Optional[Preferences] = Field(
         default=None,
         description=(
