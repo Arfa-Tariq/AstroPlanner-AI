@@ -57,6 +57,24 @@ def prompt_yes_no(label: str) -> bool:
         print("  Please enter y or n.")
 
 
+def prompt_int(label: str, min_val: int = None, max_val: int = None) -> int:
+    """Repeatedly prompts until a valid integer within optional bounds is entered."""
+    while True:
+        raw = input(f"{label}: ").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            print("  Invalid whole number, try again.")
+            continue
+        if min_val is not None and value < min_val:
+            print(f"  Must be at least {min_val}.")
+            continue
+        if max_val is not None and value > max_val:
+            print(f"  Must be at most {max_val}.")
+            continue
+        return value
+
+
 def prompt_multi_choice(label: str, choices: list[str]) -> list[str]:
     """
     Displays a numbered list and lets the user pick zero or more entries by
@@ -140,6 +158,9 @@ def collect_weekly_plan_request_cli() -> WeeklyPlanRequest:
             },
         },
     }
+
+    if prompt_yes_no("Do you know your site's Bortle dark-sky scale? (1=excellent dark sky, 9=inner-city)"):
+        raw["user"]["bortle_scale"] = prompt_int("Bortle scale", 1, 9)
 
     if prompt_yes_no("Do you know your telescope's optical design?"):
         raw["user"]["telescope"]["type"] = prompt_choice(
