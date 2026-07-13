@@ -75,6 +75,68 @@ def prompt_int(label: str, min_val: int = None, max_val: int = None) -> int:
         return value
 
 
+# Area type -> baseline Bortle estimate. Ordered brightest-first to match
+# how people naturally describe where they live (city vs. suburb vs.
+# rural), rather than requiring recognition of specific astronomical
+# effects like the original class-by-class ladder did.
+AREA_TYPE_BORTLE_MAP = [
+    ("Large city downtown / city center", 9),
+    ("City or urban neighborhood", 8),
+    ("Suburb of a city", 6),
+    ("Small town", 5),
+    ("Rural area, near a town", 4),
+    ("Rural area, far from towns", 3),
+    ("Very remote (desert, mountains, designated dark-sky area)", 2),
+]
+
+
+def estimate_bortle_scale_interactive() -> int:
+    """
+    User-friendly self-assessment for users who don't already know their
+    Bortle number: pick the area type that best matches the observing
+    site, then answer one plain-language sanity-check question. Chosen
+    over a stricter multi-question ladder because most users can
+    confidently describe their surroundings ("suburb", "rural") without
+    needing to recognize specific astronomical effects (zodiacal light,
+    M33 naked-eye visibility, etc.).
+
+    The sanity check exists because area type alone is a rough proxy —
+    e.g. a "rural" site near an unlit highway or industrial glow can be
+    brighter than the label suggests, and a "suburb" backing onto a dark
+    park/coastline can be darker. If the Milky Way answer disagrees with
+    what the area type would predict, the estimate is nudged two classes
+    toward what was actually reported; otherwise the area-type baseline
+    is used as-is.
+
+    NOT a measured value — a deliberately rough estimate for planning
+    purposes, not a substitute for an actual SQM reading.
+    """
+    labels = [label for label, _ in AREA_TYPE_BORTLE_MAP]
+    print("  Which best describes where you'll be observing from?")
+    for i, label in enumerate(labels, 1):
+        print(f"    {i}. {label}")
+
+    while True:
+        raw = input("  Enter a number: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(labels):
+            base_bortle = AREA_TYPE_BORTLE_MAP[int(raw) - 1][1]
+            break
+        print(f"  Please enter a number from 1 to {len(labels)}.")
+
+    milky_way_visible = prompt_yes_no(
+        "  Quick check: on a clear, moonless night, can you see the Milky Way "
+        "as a hazy band across the sky with just your eyes"
+    )
+
+    if base_bortle >= 6 and milky_way_visible:
+        # Labeled as a brighter area, but the sky's actually darker than that.
+        return max(1, base_bortle - 2)
+    if base_bortle <= 4 and not milky_way_visible:
+        # Labeled as a darker area, but the sky's actually brighter than that.
+        return min(9, base_bortle + 2)
+    return base_bortle
+
+
 def prompt_multi_choice(label: str, choices: list[str]) -> list[str]:
     """
     Displays a numbered list and lets the user pick zero or more entries by
@@ -159,8 +221,17 @@ def collect_weekly_plan_request_cli() -> WeeklyPlanRequest:
         },
     }
 
-    if prompt_yes_no("Do you know your site's Bortle dark-sky scale? (1=excellent dark sky, 9=inner-city)"):
-        raw["user"]["bortle_scale"] = prompt_int("Bortle scale", 1, 9)
+    bortle_choice = prompt_choice(
+        "Bortle dark-sky scale for your site: do you already know the number, "
+        "want a guided estimate based on what you can see, or want to skip it",
+        ["know", "estimate", "skip"],
+    )
+    if bortle_choice == "know":
+        raw["user"]["bortle_scale"] = prompt_int(
+            "Bortle scale (1=excellent dark sky, 9=inner-city)", 1, 9
+        )
+    elif bortle_choice == "estimate":
+        raw["user"]["bortle_scale"] = estimate_bortle_scale_interactive()
 
     if prompt_yes_no("Do you know your telescope's optical design?"):
         raw["user"]["telescope"]["type"] = prompt_choice(
