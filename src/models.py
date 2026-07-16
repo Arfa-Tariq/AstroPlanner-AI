@@ -135,7 +135,7 @@ class TelescopeSpec(BaseModel):
             "apertures reveal fainter objects and finer detail. Realistic amateur "
             "range: 10mm-1000mm."
         ),
-        gt=10,
+        ge=10,
         le=1000,
     )
     focal_length_mm: float = Field(
@@ -146,7 +146,7 @@ class TelescopeSpec(BaseModel):
             "and together with aperture to derive focal_ratio. Realistic amateur "
             "range: 100mm-5000mm."
         ),
-        gt=100,
+        ge=100,
         le=5000,
     )
     focal_ratio: Optional[float] = Field(
@@ -192,13 +192,13 @@ class CameraSpec(BaseModel):
     sensor_width_mm: float = Field(
         ...,
         description="Physical width of the camera's image sensor, in millimeters. Realistic range: 4mm-50mm.",
-        gt=4,
+        ge=4,
         le=50,
     )
     sensor_height_mm: float = Field(
         ...,
         description="Physical height of the camera's image sensor, in millimeters. Realistic range: 4mm-50mm.",
-        gt=4,
+        ge=4,
         le=50,
     )
     pixel_size_um: float = Field(
@@ -210,7 +210,7 @@ class CameraSpec(BaseModel):
             "well-matched ('oversampled' or 'undersampled') for a given target. "
             "Realistic range: 1µm-15µm."
         ),
-        gt=1,
+        ge=1,
         le=15,
     )
 
