@@ -343,13 +343,27 @@ class UserProfile(BaseModel):
 class WeeklyPlanRequest(BaseModel):
     """
     Top-level request object representing a request to generate a full
-    7-day observation plan for a user. There is no date field — the system
-    always plans from today through today + 6 days. This is the single
-    input object passed into every downstream notebook/module, and later
-    becomes the structured input referenced by the LangChain tools and the
-    LLM chatbot.
+    7-day observation plan for a user, covering generated_at through
+    generated_at + 6 days.
+    This is the single input object passed into every downstream
+    notebook/module, and later becomes the structured input referenced
+    by the LangChain tools and the LLM chatbot.
     """
     user: UserProfile = Field(..., description="The requesting user's full profile.")
+    generated_at: date_type = Field(
+        default_factory=date_type.today,
+        description=(
+            "The date this plan's 7-day window starts from (today through "
+            "today + 6 days), fixed once at creation time in notebook 01 "
+            "and persisted in current_request.json. Every downstream "
+            "notebook (02, 03, 04, ...) reads THIS value instead of "
+            "independently calling today() — otherwise notebooks run on "
+            "different calendar days end up with 7-day windows that don't "
+            "fully overlap, silently dropping nights where they disagree. "
+            "Only recomputed if this field is genuinely absent from the "
+            "loaded JSON (e.g. an old pre-v2 fixture)."
+        ),
+    )
     notes: Optional[str] = Field(
         default=None,
         description=(
