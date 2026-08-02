@@ -1,12 +1,12 @@
 """
-AstroPlanner — Orchestrator (v0: one tool, Groq)
+AstroPlanner — Orchestrator (v1: two tools, Groq)
 
-This is the smallest possible version of the "Conversation Agent" from
-the architecture doc. It knows about exactly one tool (weather) so the
-loop itself is easy to see clearly. Once this works, adding the other
-four tools (visibility, recommendation, fov, scheduler) is just adding
-more entries to TOOLS and TOOL_FUNCTIONS — the loop code below does not
-change.
+This is the "Conversation Agent" from the architecture doc, built up
+incrementally. Currently wired to 2 tools: weather and visibility.
+Adding the remaining three (recommendation, fov, scheduler) is the same
+3-step pattern each time — describe it in TOOLS, write a small adapter
+function, add one elif line in run_agent_turn. The loop itself
+(run_agent_turn) does not change as tools are added.
 
 Requires: pip install groq
 Requires: an env var GROQ_API_KEY (get one free at console.groq.com)
@@ -18,10 +18,27 @@ import os
 from groq import Groq
 
 from weather import get_weekly_sky_conditions
+from visibility import VisibilityEngine
 from models import UserProfile
 
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
 MODEL = "llama-3.3-70b-versatile"  # supports tool calling on Groq
+
+# ---------------------------------------------------------------------
+# VisibilityEngine cache — this is the "build once, reuse" idea from
+# visibility.py made real. Keyed by (lat, lon, aperture) so a second
+# question about the SAME setup reuses the already-loaded catalog and
+# ephemeris instead of redownloading them. A real session system will
+# replace this dict later; for now it's enough to prove the pattern.
+# ---------------------------------------------------------------------
+_visibility_engine_cache: dict = {}
+
+
+def get_or_build_visibility_engine(latitude: float, longitude: float, aperture_mm: float) -> VisibilityEngine:
+    key = (latitude, longitude, aperture_mm)
+    if key not in _visibility_engine_cache:
+        _visibility_engine_cache[key] = VisibilityEngine(latitude, longitude, aperture_mm)
+    return _visibility_engine_cache[key]
 
 
 # ---------------------------------------------------------------------
@@ -60,15 +77,42 @@ TOOLS = [
                 "required": ["latitude", "longitude"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weekly_visibility",
+            "description": (
+                "Gets the list of celestial objects (planets, Moon, deep-sky "
+                "objects like galaxies/nebulae/clusters) observable over the "
+                "next 7 nights from a specific location with a telescope of a "
+                "given aperture. Includes rise/transit/set times and peak "
+                "altitude. Use this when the user asks what's visible, what "
+                "they can observe, or wants object rise/set times."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "latitude": {"type": "number", "description": "Observing site latitude in decimal degrees."},
+                    "longitude": {"type": "number", "description": "Observing site longitude in decimal degrees."},
+                    "aperture_mm": {
+                        "type": "number",
+                        "description": (
+                            "Telescope aperture in millimeters. Determines how faint an "
+                            "object can be seen. Ask the user if unknown; do not guess silently."
+                        ),
+                    },
+                },
+                "required": ["latitude", "longitude", "aperture_mm"],
+            },
+        },
+    },
 ]
 
-# Maps the tool name the model asks for -> the real Python function to run.
-# The model only ever sees the name "get_weekly_sky_conditions" (a string);
-# this dict is how your code turns that string back into an actual callable.
-TOOL_FUNCTIONS = {
-    "get_weekly_sky_conditions": get_weekly_sky_conditions,
-}
+# Dispatch from tool name (a string the model sends) -> the real adapter
+# function to run. See the if/elif chain inside run_agent_turn — that's
+# where this mapping is actually used. Adding tool #3 later means: one
+# new entry in TOOLS above, one new adapter function, one new elif line.
 
 
 def call_weather_tool(latitude: float, longitude: float) -> list:
@@ -89,6 +133,18 @@ def call_weather_tool(latitude: float, longitude: float) -> list:
         telescope={"aperture_mm": 100, "focal_length_mm": 500},
     )
     return get_weekly_sky_conditions(stub_user, date.today())
+
+
+def call_visibility_tool(latitude: float, longitude: float, aperture_mm: float) -> list:
+    """
+    Adapter for the visibility tool. Unlike call_weather_tool, this doesn't
+    rebuild everything each time — it fetches (or builds, first time only)
+    a cached VisibilityEngine for this exact (lat, lon, aperture)
+    combination, then just asks it for this week's visibility.
+    """
+    from datetime import date
+    engine = get_or_build_visibility_engine(latitude, longitude, aperture_mm)
+    return engine.get_weekly_visibility(date.today())
 
 
 def run_agent_turn(user_message: str, history: list = None) -> tuple[str, list]:
@@ -121,6 +177,8 @@ def run_agent_turn(user_message: str, history: list = None) -> tuple[str, list]:
 
                 if fn_name == "get_weekly_sky_conditions":
                     result = call_weather_tool(**fn_args)
+                elif fn_name == "get_weekly_visibility":
+                    result = call_visibility_tool(**fn_args)
                 else:
                     result = {"error": f"Unknown tool: {fn_name}"}
 
