@@ -1,158 +1,70 @@
 """
-AstroPlanner — Orchestrator (v1: two tools, Groq)
+AstroPlanner — Orchestrator (LangGraph version)
 
-This is the "Conversation Agent" from the architecture doc, built up
-incrementally. Currently wired to 2 tools: weather and visibility.
-Adding the remaining three (recommendation, fov, scheduler) is the same
-3-step pattern each time — describe it in TOOLS, write a small adapter
-function, add one elif line in run_agent_turn. The loop itself
-(run_agent_turn) does not change as tools are added.
+Replaces the hand-rolled while-loop from orchestrator.py v0/v1 with
+LangGraph's prebuilt create_react_agent. Conceptually identical to what
+you already built and tested — same idea: user message -> model decides
+tool or answer -> if tool, run it, feed result back -> repeat. LangGraph
+just implements that loop for you, as a compiled graph, and adds
+conversation memory (via a checkpointer) for free.
 
-Requires: pip install groq
-Requires: an env var GROQ_API_KEY (get one free at console.groq.com)
+What's genuinely new to learn here, vs. the raw version:
+  - @tool decorator: turns a plain function into something the agent can
+    call, using its docstring as the description the model sees (same
+    role as the JSON schemas we wrote by hand before).
+  - create_react_agent: builds the whole graph (call model -> check for
+    tool calls -> run tools -> loop) in one line.
+  - MemorySaver + thread_id: LangGraph's answer to "remember this
+    conversation" — a thread_id is like a conversation/session key. Each
+    distinct thread_id gets its own remembered message history.
+
+weather.py, visibility.py, and storage.py are UNCHANGED — this file only
+wraps them differently. That's the payoff of having kept them
+framework-agnostic from the start.
 """
 
- 
-import json
 import os
- 
-from groq import Groq
- 
+from datetime import date
+
+from langchain_core.tools import tool
+from langchain_groq import ChatGroq
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
+
 from weather import get_weekly_sky_conditions
 from visibility import VisibilityEngine
 from models import UserProfile
- 
-client = Groq(api_key=os.environ["GROQ_API_KEY"])
-MODEL = "llama-3.3-70b-versatile"  # supports tool calling on Groq
- 
-# ---------------------------------------------------------------------
-# VisibilityEngine cache — this is the "build once, reuse" idea from
-# visibility.py made real. Keyed by (lat, lon, aperture) so a second
-# question about the SAME setup reuses the already-loaded catalog and
-# ephemeris instead of redownloading them. A real session system will
-# replace this dict later; for now it's enough to prove the pattern.
-# ---------------------------------------------------------------------
+import storage
+
+storage.init_db()
+
+llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.environ["GROQ_API_KEY"])
+
+DEFAULT_USER_NAME = "chat_user"
 _visibility_engine_cache: dict = {}
- 
- 
+_current_session_id: "int | None" = None
+
+
+def get_or_create_session(latitude: float, longitude: float, aperture_mm: float = None) -> int:
+    global _current_session_id
+    if _current_session_id is None:
+        _current_session_id = storage.create_session(DEFAULT_USER_NAME, latitude, longitude, aperture_mm)
+    return _current_session_id
+
+
 def get_or_build_visibility_engine(latitude: float, longitude: float, aperture_mm: float) -> VisibilityEngine:
     key = (latitude, longitude, aperture_mm)
     if key not in _visibility_engine_cache:
         _visibility_engine_cache[key] = VisibilityEngine(latitude, longitude, aperture_mm)
     return _visibility_engine_cache[key]
- 
- 
-# ---------------------------------------------------------------------
-# Step 1: Describe the tool to the LLM.
-#
-# This is JSON, not Python — it's the ONLY thing the model ever sees
-# about get_weekly_sky_conditions. It cannot see your source code. If
-# the description or parameter docs are vague, the model will guess
-# wrong about when/how to call it. Be as explicit as you'd be
-# explaining it to a new teammate.
-# ---------------------------------------------------------------------
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weekly_sky_conditions",
-            "description": (
-                "Gets a 7-night weather and sky-quality outlook (cloud cover, "
-                "wind, humidity, seeing/transparency where available) for a "
-                "specific latitude/longitude, starting today. Use this whenever "
-                "the user asks about weather, sky conditions, or whether "
-                "tonight/this week is good for observing."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "latitude": {
-                        "type": "number",
-                        "description": "Observing site latitude in decimal degrees.",
-                    },
-                    "longitude": {
-                        "type": "number",
-                        "description": "Observing site longitude in decimal degrees.",
-                    },
-                },
-                "required": ["latitude", "longitude"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weekly_visibility",
-            "description": (
-                "Gets the list of celestial objects (planets, Moon, deep-sky "
-                "objects like galaxies/nebulae/clusters) observable over the "
-                "next 7 nights from a specific location with a telescope of a "
-                "given aperture. Includes rise/transit/set times and peak "
-                "altitude. Use this when the user asks what's visible, what "
-                "they can observe, or wants object rise/set times."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "latitude": {"type": "number", "description": "Observing site latitude in decimal degrees."},
-                    "longitude": {"type": "number", "description": "Observing site longitude in decimal degrees."},
-                    "aperture_mm": {
-                        "type": "number",
-                        "description": (
-                            "Telescope aperture in millimeters. Determines how faint an "
-                            "object can be seen. Ask the user if unknown; do not guess silently."
-                        ),
-                    },
-                },
-                "required": ["latitude", "longitude", "aperture_mm"],
-            },
-        },
-    },
-]
- 
-# Dispatch from tool name (a string the model sends) -> the real adapter
-# function to run. See the if/elif chain inside run_agent_turn — that's
-# where this mapping is actually used. Adding tool #3 later means: one
-# new entry in TOOLS above, one new adapter function, one new elif line.
- 
- 
-def call_weather_tool(latitude: float, longitude: float) -> list:
-    """
-    Thin adapter: the notebook function wants a UserProfile + start_date,
-    but the LLM only knows lat/lon (see the schema above — deliberately
-    minimal). This function bridges that gap so weather.py itself never
-    has to know anything about how it's being invoked.
-    """
-    from datetime import date
- 
-    # Minimal throwaway profile — only lat/lon are used by this function.
-    stub_user = UserProfile(
-        name="chat_user",
-        latitude=latitude,
-        longitude=longitude,
-        experience_level="beginner",
-        telescope={"aperture_mm": 100, "focal_length_mm": 500},
-    )
-    return get_weekly_sky_conditions(stub_user, date.today())
- 
- 
+
+
 def _trim_visibility_for_chat(weekly: list, max_objects_per_night: int = 8) -> list:
-    """
-    The full weekly_visibility output can easily be 100+ objects across 7
-    nights, each with a dozen fields (RA/Dec, moon separation, etc). That's
-    correct for internal use but far too large to hand an LLM — it blows
-    past free-tier token-per-minute limits immediately. The model only
-    needs enough to talk about the sky sensibly, not your full dataset.
-    Keeps: name, type, peak altitude, transit/peak time, rise/set-ish
-    fields, magnitude. Drops: RA/Dec, moon_separation_deg, size_arcmin,
-    and caps each night to the top N objects (already sorted by
-    brightness/altitude upstream, so top N = the best ones).
-    """
+    """Same trimming logic as before — still needed, LangChain doesn't do this for you."""
     trimmed = []
     for night in weekly:
-        kept_objects = []
-        for obj in night["objects"][:max_objects_per_night]:
-            kept_objects.append({
+        kept_objects = [
+            {
                 "name": obj.get("name"),
                 "common_name": obj.get("common_name"),
                 "type": obj.get("type"),
@@ -162,85 +74,104 @@ def _trim_visibility_for_chat(weekly: list, max_objects_per_night: int = 8) -> l
                 "rise": obj.get("rise_time") or obj.get("above_30deg_from_local"),
                 "set": obj.get("set_time") or obj.get("above_30deg_until_local"),
                 "is_solar_system": obj.get("is_solar_system"),
-            })
+            }
+            for obj in night["objects"][:max_objects_per_night]
+        ]
         trimmed.append({
-            "date": night["date"],
-            "day_offset": night["day_offset"],
+            "date": night["date"], "day_offset": night["day_offset"],
             "total_visible_object_count": night["visible_object_count"],
-            "objects_shown": len(kept_objects),
-            "objects": kept_objects,
+            "objects_shown": len(kept_objects), "objects": kept_objects,
         })
     return trimmed
- 
- 
-def call_visibility_tool(latitude: float, longitude: float, aperture_mm: float) -> list:
-    """
-    Adapter for the visibility tool. Unlike call_weather_tool, this doesn't
-    rebuild everything each time — it fetches (or builds, first time only)
-    a cached VisibilityEngine for this exact (lat, lon, aperture)
-    combination, then just asks it for this week's visibility.
- 
-    Trims the result before returning — see _trim_visibility_for_chat.
-    """
-    from datetime import date
+
+
+# ---------------------------------------------------------------------
+# Tools. The @tool decorator reads the function's type hints (for the
+# parameter schema) and its docstring (for the description) — this
+# REPLACES the JSON schema dicts we wrote by hand in the raw version.
+# Write the docstring like you're still explaining it to the model.
+# ---------------------------------------------------------------------
+
+@tool
+def weather_tool(latitude: float, longitude: float) -> list:
+    """Gets a 7-night weather and sky-quality outlook (cloud cover, wind,
+    humidity, seeing/transparency where available) for a specific
+    latitude/longitude, starting today. Use for questions about weather,
+    sky conditions, or whether tonight/this week is good for observing."""
+    session_id = get_or_create_session(latitude, longitude)
+    stub_user = UserProfile(
+        name="chat_user", latitude=latitude, longitude=longitude,
+        experience_level="beginner",
+        telescope={"aperture_mm": 100, "focal_length_mm": 500},
+    )
+    result = get_weekly_sky_conditions(stub_user, date.today())
+    storage.save_result(session_id, "weather_tool", result)
+    return result
+
+
+@tool
+def visibility_tool(latitude: float, longitude: float, aperture_mm: float) -> list:
+    """Gets celestial objects (planets, Moon, deep-sky objects) observable
+    over the next 7 nights from a location with a telescope of a given
+    aperture, including rise/transit/set times and peak altitude. Use for
+    questions about what's visible or observable, or object rise/set times.
+    Ask the user for aperture_mm if unknown — do not guess it silently."""
+    session_id = get_or_create_session(latitude, longitude, aperture_mm)
     engine = get_or_build_visibility_engine(latitude, longitude, aperture_mm)
     full_result = engine.get_weekly_visibility(date.today())
-    return _trim_visibility_for_chat(full_result)
- 
- 
-def run_agent_turn(user_message: str, history: list = None) -> tuple[str, list]:
-    """
-    One full turn: send the user's message (+ prior history) to Groq,
-    execute any tool calls it asks for, feed results back, and loop
-    until it gives a plain-text answer. Returns (reply_text, updated_history)
-    so the caller can keep chatting across turns.
-    """
-    messages = (history or []) + [{"role": "user", "content": user_message}]
- 
-    while True:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
-        reply = response.choices[0].message
- 
-        # Case A: the model wants to call one or more tools.
-        if reply.tool_calls:
-            # Record the model's tool-call request in the conversation...
-            messages.append(reply)
- 
-            # ...then execute each requested call and append its result.
-            for tool_call in reply.tool_calls:
-                fn_name = tool_call.function.name
-                fn_args = json.loads(tool_call.function.arguments)
- 
-                if fn_name == "get_weekly_sky_conditions":
-                    result = call_weather_tool(**fn_args)
-                elif fn_name == "get_weekly_visibility":
-                    result = call_visibility_tool(**fn_args)
-                else:
-                    result = {"error": f"Unknown tool: {fn_name}"}
- 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(result, default=str),
-                })
- 
-            # Loop back around: send the tool result back to the model
-            # so it can either call another tool or write a final answer.
-            continue
- 
-        # Case B: the model gave a final natural-language answer. Done.
-        messages.append({"role": "assistant", "content": reply.content})
-        return reply.content, messages
- 
- 
-if __name__ == "__main__":
-    reply, history = run_agent_turn(
-        "How does the sky look this week for someone observing at "
-        "latitude 33.2, longitude 32.4?"
+    trimmed = _trim_visibility_for_chat(full_result)
+    storage.save_result(session_id, "visibility_tool", trimmed)
+    return trimmed
+
+
+@tool
+def get_past_session_results(session_id: int) -> list:
+    """Retrieves saved results from a PAST observation session by its id,
+    when the user refers to a previous plan/night/session not already
+    visible earlier in this conversation. Session ids are listed in the
+    system prompt — look there before asking the user for one."""
+    return storage.get_session_results(session_id)
+
+
+def build_system_prompt() -> str:
+    """Same 'context builder' idea as before: cheap session metadata always
+    present, full data fetched only on demand via get_past_session_results."""
+    recent = storage.list_recent_sessions(DEFAULT_USER_NAME, limit=5)
+    if not recent:
+        return "You are AstroPlanner, an astronomy observation planning assistant."
+    lines = [f"- session_id={s['id']}, {str(s['created_at'])[:10]}, lat={s['latitude']}, lon={s['longitude']}" for s in recent]
+    return (
+        "You are AstroPlanner, an astronomy observation planning assistant.\n"
+        "The user has these past sessions available (call get_past_session_results "
+        "only if they ask about one — don't mention them unprompted):\n" + "\n".join(lines)
     )
-    print(reply)
+
+
+# ---------------------------------------------------------------------
+# The agent itself. This ONE call replaces the entire hand-rolled
+# while-loop from orchestrator.py. checkpointer=MemorySaver() means the
+# graph remembers messages per thread_id automatically — you don't
+# manage a `history` list by hand anymore.
+# ---------------------------------------------------------------------
+agent = create_react_agent(
+    model=llm,
+    tools=[weather_tool, visibility_tool, get_past_session_results],
+    prompt=build_system_prompt(),
+    checkpointer=MemorySaver(),
+)
+
+
+def chat(user_message: str, thread_id: str = "default") -> str:
+    """
+    Run one turn. thread_id identifies the conversation — same thread_id
+    across calls = the agent remembers prior turns; a new thread_id =
+    a fresh conversation (though get_past_session_results can still pull
+    up old DB sessions regardless of thread).
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    result = agent.invoke({"messages": [{"role": "user", "content": user_message}]}, config)
+    return result["messages"][-1].content
+
+
+if __name__ == "__main__":
+    print(chat("How does the sky look this week at latitude 33.2, longitude 32.4?"))
