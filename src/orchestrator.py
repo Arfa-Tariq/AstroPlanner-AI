@@ -1,177 +1,251 @@
 """
-AstroPlanner — Orchestrator (LangGraph version)
+AstroPlanner — Orchestrator (LangGraph + Supabase)
 
-Replaces the hand-rolled while-loop from orchestrator.py v0/v1 with
-LangGraph's prebuilt create_react_agent. Conceptually identical to what
-you already built and tested — same idea: user message -> model decides
-tool or answer -> if tool, run it, feed result back -> repeat. LangGraph
-just implements that loop for you, as a compiled graph, and adds
-conversation memory (via a checkpointer) for free.
+Two fixes over the previous version, worth understanding rather than
+just diffing:
 
-What's genuinely new to learn here, vs. the raw version:
-  - @tool decorator: turns a plain function into something the agent can
-    call, using its docstring as the description the model sees (same
-    role as the JSON schemas we wrote by hand before).
-  - create_react_agent: builds the whole graph (call model -> check for
-    tool calls -> run tools -> loop) in one line.
-  - MemorySaver + thread_id: LangGraph's answer to "remember this
-    conversation" — a thread_id is like a conversation/session key. Each
-    distinct thread_id gets its own remembered message history.
+1. STALE PROMPT BUG: the old code built the system prompt once, at
+   import time (`prompt=build_system_prompt()`), before any session
+   existed. LangGraph's create_react_agent lets `prompt` be a CALLABLE
+   instead of a fixed string — `dynamic_prompt(state, config)` below is
+   invoked fresh on every turn, so "recent sessions" always reflects
+   what's actually in Supabase right now. This callable IS the context
+   builder from the architecture doc — it's not a separate graph node
+   because nothing else needs to happen between "message arrives" and
+   "agent runs" for this app's scope.
 
-weather.py, visibility.py, and storage.py are UNCHANGED — this file only
-wraps them differently. That's the payoff of having kept them
-framework-agnostic from the start.
+2. PIPELINE AS ONE TOOL: rather than five separate stage tools the LLM
+   would have to call in the right order (risk: it calls fov before
+   recommendation, or forgets scheduler), `create_observation_plan` runs
+   weather -> visibility -> recommendation -> fov -> scheduler
+   server-side as one unit and persists every stage to Supabase. This
+   matches the guide's own pipeline diagram, where "Pipeline Executes"
+   is one block from the user's perspective. Narrower follow-up
+   questions get their own tools instead of re-running everything.
 """
 
 import os
 from datetime import date
 
 from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
-from weather import get_weekly_sky_conditions
+import weather
+import recommendation
+import fov as fov_module
+import scheduler
 from visibility import VisibilityEngine
 from models import UserProfile
 import storage
 
-storage.init_db()
-
 llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.environ["GROQ_API_KEY"])
 
-DEFAULT_USER_NAME = "chat_user"
+DATA_DIR = os.environ.get("ASTROPLANNER_DATA_DIR", "./data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Caches — same "build once per conversation, not once per call" idea as
+# VisibilityEngine's own internal ephemeris/catalog caching. Keyed so
+# multiple users/locations in the same process don't collide or
+# needlessly re-download the NGC catalog.
 _visibility_engine_cache: dict = {}
-_current_session_id: "int | None" = None
 
-
-def get_or_create_session(latitude: float, longitude: float, aperture_mm: float = None) -> int:
-    global _current_session_id
-    if _current_session_id is None:
-        _current_session_id = storage.create_session(DEFAULT_USER_NAME, latitude, longitude, aperture_mm)
-    return _current_session_id
+# thread_id -> user_id. A real app would resolve this from an auth
+# session; here chat() takes user_name explicitly and this dict is what
+# lets the dynamic_prompt callable (which only receives thread_id via
+# LangGraph's config) look up which user it's building context for.
+_thread_user_cache: dict[str, str] = {}
 
 
 def get_or_build_visibility_engine(latitude: float, longitude: float, aperture_mm: float) -> VisibilityEngine:
     key = (latitude, longitude, aperture_mm)
     if key not in _visibility_engine_cache:
-        _visibility_engine_cache[key] = VisibilityEngine(latitude, longitude, aperture_mm)
+        _visibility_engine_cache[key] = VisibilityEngine(latitude, longitude, aperture_mm, data_dir=DATA_DIR)
     return _visibility_engine_cache[key]
 
 
-def _trim_visibility_for_chat(weekly: list, max_objects_per_night: int = 8) -> list:
-    """Same trimming logic as before — still needed, LangChain doesn't do this for you."""
-    trimmed = []
-    for night in weekly:
-        kept_objects = [
-            {
-                "name": obj.get("name"),
-                "common_name": obj.get("common_name"),
-                "type": obj.get("type"),
-                "magnitude": obj.get("magnitude"),
-                "peak_altitude_deg": obj.get("peak_altitude_deg"),
-                "peak_or_transit_time": obj.get("peak_time_local") or obj.get("transit_time"),
-                "rise": obj.get("rise_time") or obj.get("above_30deg_from_local"),
-                "set": obj.get("set_time") or obj.get("above_30deg_until_local"),
-                "is_solar_system": obj.get("is_solar_system"),
-            }
-            for obj in night["objects"][:max_objects_per_night]
-        ]
-        trimmed.append({
-            "date": night["date"], "day_offset": night["day_offset"],
-            "total_visible_object_count": night["visible_object_count"],
-            "objects_shown": len(kept_objects), "objects": kept_objects,
-        })
-    return trimmed
+def _trim_schedule_for_chat(weekly_schedule: list, max_nights: int = 3) -> list:
+    """
+    Schedules are already compact (a handful of timeline slots per
+    night), but a full 7-night schedule is still more than needed for a
+    typical chat answer. Trim to the first few nights — same reasoning
+    as the old _trim_visibility_for_chat: keep tool OUTPUT small so the
+    LLM's next turn doesn't pay to re-read a week of data it wasn't
+    asked about. Full data is always still in Supabase via session_id.
+    """
+    return weekly_schedule[:max_nights]
 
 
 # ---------------------------------------------------------------------
-# Tools. The @tool decorator reads the function's type hints (for the
-# parameter schema) and its docstring (for the description) — this
-# REPLACES the JSON schema dicts we wrote by hand in the raw version.
-# Write the docstring like you're still explaining it to the model.
+# Tools
 # ---------------------------------------------------------------------
 
 @tool
-def weather_tool(latitude: float, longitude: float) -> list:
-    """Gets a 7-night weather and sky-quality outlook (cloud cover, wind,
-    humidity, seeing/transparency where available) for a specific
-    latitude/longitude, starting today. Use for questions about weather,
-    sky conditions, or whether tonight/this week is good for observing."""
-    session_id = get_or_create_session(latitude, longitude)
-    stub_user = UserProfile(
-        name="chat_user", latitude=latitude, longitude=longitude,
-        experience_level="beginner",
-        telescope={"aperture_mm": 100, "focal_length_mm": 500},
+def create_observation_plan(
+    user_name: str,
+    latitude: float,
+    longitude: float,
+    aperture_mm: float,
+    focal_length_mm: float,
+    experience_level: str = "beginner",
+    sensor_width_mm: float = None,
+    sensor_height_mm: float = None,
+    pixel_size_um: float = None,
+    bortle_scale: int = None,
+    notes: str = None,
+) -> dict:
+    """Runs the full observation-planning pipeline (weather, visibility,
+    recommendations, field-of-view, and a night-by-night schedule) for a
+    location and telescope, and saves every stage as a new Observation
+    Session. Use this when the user wants a new plan, e.g. "plan my
+    observing session for this week" or "what should I look at tonight
+    from [location]". Ask for latitude/longitude and aperture_mm if not
+    given — do not guess coordinates. sensor_* / pixel_size_um are only
+    needed if the user has a camera for astrophotography; omit them for
+    visual-only observing."""
+    stub_camera = None
+    if sensor_width_mm and sensor_height_mm and pixel_size_um:
+        stub_camera = {
+            "sensor_width_mm": sensor_width_mm,
+            "sensor_height_mm": sensor_height_mm,
+            "pixel_size_um": pixel_size_um,
+        }
+
+    user = UserProfile(
+        name=user_name, latitude=latitude, longitude=longitude,
+        experience_level=experience_level, bortle_scale=bortle_scale,
+        telescope={"aperture_mm": aperture_mm, "focal_length_mm": focal_length_mm},
+        camera=stub_camera,
     )
-    result = get_weekly_sky_conditions(stub_user, date.today())
-    storage.save_result(session_id, "weather_tool", result)
-    return result
 
+    user_id = storage.get_or_create_user(user_name)
+    equipment_id = storage.save_equipment(user_id, user)
+    session_id = storage.create_session(
+        user_id=user_id, latitude=latitude, longitude=longitude,
+        generated_at=date.today().isoformat(), equipment_id=equipment_id, notes=notes,
+    )
 
-@tool
-def visibility_tool(latitude: float, longitude: float, aperture_mm: float) -> list:
-    """Gets celestial objects (planets, Moon, deep-sky objects) observable
-    over the next 7 nights from a location with a telescope of a given
-    aperture, including rise/transit/set times and peak altitude. Use for
-    questions about what's visible or observable, or object rise/set times.
-    Ask the user for aperture_mm if unknown — do not guess it silently."""
-    session_id = get_or_create_session(latitude, longitude, aperture_mm)
     engine = get_or_build_visibility_engine(latitude, longitude, aperture_mm)
-    full_result = engine.get_weekly_visibility(date.today())
-    trimmed = _trim_visibility_for_chat(full_result)
-    storage.save_result(session_id, "visibility_tool", trimmed)
-    return trimmed
+
+    weekly_weather = weather.get_weekly_sky_conditions(user, date.today())
+    storage.save_stage_result(session_id, "weather", weekly_weather)
+
+    weekly_visibility = engine.get_weekly_visibility(date.today())
+    storage.save_stage_result(session_id, "visibility", weekly_visibility)
+
+    weekly_recommendations = recommendation.get_weekly_recommendations(
+        user, weekly_weather, weekly_visibility, bortle_scale, engine.ts, engine.eph,
+    )
+    storage.save_stage_result(session_id, "recommendation", weekly_recommendations)
+
+    weekly_fov, setup_summary = fov_module.get_weekly_fov_analysis(weekly_recommendations, user)
+    storage.save_stage_result(session_id, "fov", {"nights": weekly_fov, "setup_summary": setup_summary})
+
+    weekly_schedule = scheduler.get_weekly_schedule(weekly_fov)
+    storage.save_stage_result(session_id, "schedule", weekly_schedule)
+
+    return {
+        "session_id": session_id,
+        "setup_summary": setup_summary,
+        "schedule_preview": _trim_schedule_for_chat(weekly_schedule),
+        "note": "Full 7-night data is saved under this session_id — call get_session_context for more.",
+    }
 
 
 @tool
-def get_past_session_results(session_id: int) -> list:
-    """Retrieves saved results from a PAST observation session by its id,
-    when the user refers to a previous plan/night/session not already
-    visible earlier in this conversation. Session ids are listed in the
-    system prompt — look there before asking the user for one."""
-    return storage.get_session_results(session_id)
+def get_session_context(session_id: str) -> dict:
+    """Retrieves everything saved for a PAST observation session by its
+    id: weather, visibility, recommendations, field-of-view analysis, and
+    schedule. Use when the user asks about a specific past plan, or asks
+    "why" something was or wasn't recommended and the answer requires
+    looking at saved reasoning rather than guessing. Session ids are
+    listed in the system context — look there before asking the user."""
+    return storage.get_full_session(session_id)
 
 
-def build_system_prompt() -> str:
-    """Same 'context builder' idea as before: cheap session metadata always
-    present, full data fetched only on demand via get_past_session_results."""
-    recent = storage.list_recent_sessions(DEFAULT_USER_NAME, limit=5)
-    if not recent:
-        return "You are AstroPlanner, an astronomy observation planning assistant."
-    lines = [f"- session_id={s['id']}, {str(s['created_at'])[:10]}, lat={s['latitude']}, lon={s['longitude']}" for s in recent]
-    return (
-        "You are AstroPlanner, an astronomy observation planning assistant.\n"
-        "The user has these past sessions available (call get_past_session_results "
-        "only if they ask about one — don't mention them unprompted):\n" + "\n".join(lines)
+@tool
+def get_recent_sessions(user_name: str, limit: int = 5) -> list:
+    """Lists a user's recent observation sessions (id, location, date,
+    revision number) without their full data. Use this to find a
+    session_id before calling get_session_context, or to answer
+    "what have I planned recently" without loading everything."""
+    user_id = storage.get_or_create_user(user_name)
+    return storage.list_recent_sessions(user_id, limit=limit)
+
+
+def build_tools() -> list:
+    return [create_observation_plan, get_session_context, get_recent_sessions]
+
+
+# ---------------------------------------------------------------------
+# Dynamic context builder — see module docstring, fix #1
+# ---------------------------------------------------------------------
+
+def dynamic_prompt(state, config) -> list:
+    """
+    Called by create_react_agent on every turn (not once at startup).
+    Builds a minimal system message: a short list of the user's recent
+    sessions, cheap enough to include always, with full data one tool
+    call away via get_session_context. This is the "context should
+    always be minimal and relevant" principle from the architecture doc,
+    implemented as a prompt function instead of a separate graph node.
+    """
+    thread_id = config.get("configurable", {}).get("thread_id")
+    user_id = _thread_user_cache.get(thread_id)
+
+    base = (
+        "You are AstroPlanner, an astronomy observation planning assistant. "
+        "You never perform astronomy calculations yourself — always call a "
+        "tool for weather, visibility, recommendations, or schedules rather "
+        "than estimating or guessing them."
     )
 
+    if user_id:
+        recent = storage.list_recent_sessions(user_id, limit=5)
+        if recent:
+            lines = [
+                f"- session_id={s['id']}, {s['generated_at']}, "
+                f"lat={s['latitude']}, lon={s['longitude']}, rev={s['revision_number']}"
+                for s in recent
+            ]
+            base += (
+                "\n\nThis user has these recent sessions (call get_session_context "
+                "only if the user asks about one — don't mention them unprompted):\n"
+                + "\n".join(lines)
+            )
 
-# ---------------------------------------------------------------------
-# The agent itself. This ONE call replaces the entire hand-rolled
-# while-loop from orchestrator.py. checkpointer=MemorySaver() means the
-# graph remembers messages per thread_id automatically — you don't
-# manage a `history` list by hand anymore.
-# ---------------------------------------------------------------------
+    return [SystemMessage(content=base)] + state["messages"]
+
+
 agent = create_react_agent(
     model=llm,
-    tools=[weather_tool, visibility_tool, get_past_session_results],
-    prompt=build_system_prompt(),
+    tools=build_tools(),
+    prompt=dynamic_prompt,
     checkpointer=MemorySaver(),
 )
 
 
-def chat(user_message: str, thread_id: str = "default") -> str:
+def chat(user_message: str, user_name: str = "chat_user", thread_id: str = "default") -> str:
     """
-    Run one turn. thread_id identifies the conversation — same thread_id
-    across calls = the agent remembers prior turns; a new thread_id =
-    a fresh conversation (though get_past_session_results can still pull
-    up old DB sessions regardless of thread).
+    Runs one turn. thread_id identifies the conversation for LangGraph's
+    checkpointer (same thread_id = agent remembers prior turns).
+    user_name resolves to a Supabase user_id, cached against thread_id so
+    dynamic_prompt (which only sees thread_id via config) can look up the
+    right user's recent sessions.
     """
+    if thread_id not in _thread_user_cache:
+        _thread_user_cache[thread_id] = storage.get_or_create_user(user_name)
+
     config = {"configurable": {"thread_id": thread_id}}
     result = agent.invoke({"messages": [{"role": "user", "content": user_message}]}, config)
     return result["messages"][-1].content
 
 
 if __name__ == "__main__":
-    print(chat("How does the sky look this week at latitude 33.2, longitude 32.4?"))
+    print(chat(
+        "Plan my observing session for tonight at latitude 33.2, longitude 32.4, "
+        "with an 8-inch (200mm) telescope, 1000mm focal length, beginner level.",
+        user_name="andrew",
+    ))
