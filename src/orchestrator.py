@@ -97,6 +97,37 @@ def _trim_schedule_for_chat(weekly_schedule: list, max_nights: int = 1) -> list:
 # Tools
 # ---------------------------------------------------------------------
 
+def _run_pipeline(user: UserProfile, session_id: str) -> dict:
+    """
+    The actual weather -> visibility -> recommendation -> fov -> scheduler
+    pipeline, saving each stage to Supabase under session_id. Extracted
+    out of create_observation_plan so revise_observation_plan can call the
+    exact same logic against a NEW session that's linked back to an
+    existing one via parent_session_id, instead of duplicating the
+    5-stage sequence. Returns the data needed for a trimmed chat reply.
+    """
+    engine = get_or_build_visibility_engine(user.latitude, user.longitude, user.telescope.aperture_mm)
+
+    weekly_weather = weather.get_weekly_sky_conditions(user, date.today())
+    storage.save_stage_result(session_id, "weather", weekly_weather)
+
+    weekly_visibility = engine.get_weekly_visibility(date.today())
+    storage.save_stage_result(session_id, "visibility", weekly_visibility)
+
+    weekly_recommendations = recommendation.get_weekly_recommendations(
+        user, weekly_weather, weekly_visibility, user.bortle_scale, engine.ts, engine.eph,
+    )
+    storage.save_stage_result(session_id, "recommendation", weekly_recommendations)
+
+    weekly_fov, setup_summary = fov_module.get_weekly_fov_analysis(weekly_recommendations, user)
+    storage.save_stage_result(session_id, "fov", {"nights": weekly_fov, "setup_summary": setup_summary})
+
+    weekly_schedule = scheduler.get_weekly_schedule(weekly_fov, max_objects=8)
+    storage.save_stage_result(session_id, "schedule", weekly_schedule)
+
+    return {"setup_summary": setup_summary, "weekly_schedule": weekly_schedule}
+
+
 @tool
 def create_observation_plan(
     latitude: float,
@@ -114,13 +145,15 @@ def create_observation_plan(
     """Runs the full observation-planning pipeline (weather, visibility,
     recommendations, field-of-view, and a night-by-night schedule) for a
     location and telescope, and saves every stage as a new Observation
-    Session. Use this when the user wants a new plan, e.g. "plan my
-    observing session for this week" or "what should I look at tonight
-    from [location]". Ask for latitude/longitude and aperture_mm if not
-    given — do not guess coordinates. sensor_* / pixel_size_um are only
-    needed if the user has a camera for astrophotography; omit them for
-    visual-only observing. Do NOT ask the user to identify themselves —
-    identity is resolved automatically."""
+    Session. Use this when the user wants a NEW plan for a location/setup
+    not seen before, e.g. "plan my observing session for this week" or
+    "what should I look at tonight from [location]". If the user instead
+    wants to redo or tweak an EXISTING plan (e.g. "regenerate with fewer
+    targets"), use revise_observation_plan instead. Ask for
+    latitude/longitude and aperture_mm if not given — do not guess
+    coordinates. sensor_* / pixel_size_um are only needed for
+    astrophotography; omit them for visual-only observing. Do NOT ask the
+    user to identify themselves — identity is resolved automatically."""
     thread_id = config["configurable"]["thread_id"]
     identity = _thread_identity_cache.get(thread_id)
     if identity is None:
@@ -148,24 +181,7 @@ def create_observation_plan(
         generated_at=date.today().isoformat(), equipment_id=equipment_id, notes=notes,
     )
 
-    engine = get_or_build_visibility_engine(latitude, longitude, aperture_mm)
-
-    weekly_weather = weather.get_weekly_sky_conditions(user, date.today())
-    storage.save_stage_result(session_id, "weather", weekly_weather)
-
-    weekly_visibility = engine.get_weekly_visibility(date.today())
-    storage.save_stage_result(session_id, "visibility", weekly_visibility)
-
-    weekly_recommendations = recommendation.get_weekly_recommendations(
-        user, weekly_weather, weekly_visibility, bortle_scale, engine.ts, engine.eph,
-    )
-    storage.save_stage_result(session_id, "recommendation", weekly_recommendations)
-
-    weekly_fov, setup_summary = fov_module.get_weekly_fov_analysis(weekly_recommendations, user)
-    storage.save_stage_result(session_id, "fov", {"nights": weekly_fov, "setup_summary": setup_summary})
-
-    weekly_schedule = scheduler.get_weekly_schedule(weekly_fov)
-    storage.save_stage_result(session_id, "schedule", weekly_schedule)
+    pipeline_result = _run_pipeline(user, session_id)
 
     # Groq's tool-message parser rejects content that isn't a non-empty
     # string (e.g. a raw dict, or "[]") — every tool below returns a JSON
@@ -173,24 +189,127 @@ def create_observation_plan(
     # fallback message when a result would otherwise be empty.
     return json.dumps({
         "session_id": session_id,
-        "setup_summary": setup_summary,
-        "schedule_preview": _trim_schedule_for_chat(weekly_schedule),
+        "setup_summary": pipeline_result["setup_summary"],
+        "schedule_preview": _trim_schedule_for_chat(pipeline_result["weekly_schedule"]),
         "note": "Full 7-night data is saved under this session_id — call get_session_context for more.",
     }, default=str)
 
 
 @tool
+def revise_observation_plan(parent_session_id: str, notes: str = None, config: RunnableConfig = None) -> str:
+    """Re-runs the observation-planning pipeline for the SAME location and
+    equipment as an existing session, saving the result as a new revision
+    linked back to it. Use this when the user wants to redo, regenerate,
+    or update a plan they already have — e.g. "regenerate tonight's plan"
+    or "run that again" — rather than create_observation_plan, which
+    would start an unrelated fresh session. Find parent_session_id via
+    get_recent_sessions or the session list already in context."""
+    thread_id = config["configurable"]["thread_id"]
+    identity = _thread_identity_cache.get(thread_id)
+    if identity is None:
+        return "No user identity bound to this conversation — this is a setup bug, not something to ask the user about."
+    user_id, user_name = identity["user_id"], identity["user_name"]
+
+    parent = storage.get_full_session(parent_session_id)
+    parent_meta = (parent or {}).get("session")
+    if not parent_meta:
+        return f"No session found with id {parent_session_id} — cannot create a revision of it."
+
+    equipment = storage.get_equipment(parent_meta["equipment_id"]) if parent_meta.get("equipment_id") else None
+    if not equipment:
+        return f"Session {parent_session_id} has no equipment on file — cannot revise it. Use create_observation_plan instead."
+
+    user = UserProfile(
+        name=user_name,
+        latitude=parent_meta["latitude"], longitude=parent_meta["longitude"],
+        experience_level=equipment["experience_level"], bortle_scale=equipment.get("bortle_scale"),
+        telescope=equipment["telescope"], camera=equipment.get("camera"),
+        mount=equipment.get("mount"), preferences=equipment.get("preferences"),
+    )
+
+    session_id = storage.create_session(
+        user_id=user_id, latitude=user.latitude, longitude=user.longitude,
+        generated_at=date.today().isoformat(), equipment_id=parent_meta["equipment_id"],
+        notes=notes, parent_session_id=parent_session_id,
+    )
+
+    pipeline_result = _run_pipeline(user, session_id)
+
+    return json.dumps({
+        "session_id": session_id,
+        "revision_of": parent_session_id,
+        "setup_summary": pipeline_result["setup_summary"],
+        "schedule_preview": _trim_schedule_for_chat(pipeline_result["weekly_schedule"]),
+        "note": "This is a new revision linked to the original session — call get_session_context for more.",
+    }, default=str)
+
+
+def _trim_session_for_chat(full_session: dict, max_nights: int = 2, top_n_objects: int = 5) -> dict:
+    """
+    get_full_session returns EVERYTHING (all 7 nights, every raw field —
+    hourly weather, every catalog candidate's ra/dec, etc). That's correct
+    for Supabase storage but far too large for a chat turn — one real call
+    requested 83k tokens against Groq's per-request limit. Trims to what a
+    "why was X recommended" question actually needs: per-night verdict +
+    top-N scored objects with their factor breakdown, for the first
+    max_nights nights. Full data is still in Supabase if a deeper look is
+    ever needed.
+    """
+    session = full_session.get("session") or {}
+    recommendation = full_session.get("recommendation") or []
+    fov = (full_session.get("fov") or {}).get("nights") or []
+    fov_by_date = {n["date"]: n for n in fov}
+
+    nights_out = []
+    for night in recommendation[:max_nights]:
+        fov_night = fov_by_date.get(night["date"])
+        fov_objects_by_name = (
+            {o["name"]: o.get("fov_analysis") for o in fov_night["recommended_objects"]}
+            if fov_night else {}
+        )
+
+        objects_out = []
+        for obj in night["recommended_objects"][:top_n_objects]:
+            fov_info = fov_objects_by_name.get(obj["name"], {})
+            objects_out.append({
+                "name": obj.get("name"),
+                "common_name": obj.get("common_name"),
+                "target_type": obj.get("target_type"),
+                "recommendation_score": obj.get("recommendation_score"),
+                "factor_scores": obj.get("factor_scores"),
+                "fov_fit": fov_info.get("fov_fit") if fov_info else None,
+            })
+
+        nights_out.append({
+            "date": night["date"],
+            "moon_illumination_pct": night.get("moon_illumination_pct"),
+            "sky_quality_verdict": night.get("sky_quality_verdict"),
+            "top_recommended_objects": objects_out,
+        })
+
+    return {
+        "session_id": session.get("id"),
+        "latitude": session.get("latitude"),
+        "longitude": session.get("longitude"),
+        "generated_at": session.get("generated_at"),
+        "revision_number": session.get("revision_number"),
+        "nights": nights_out,
+        "note": f"Showing top {top_n_objects} objects for the first {max_nights} night(s) only — full data is in Supabase under this session_id.",
+    }
+
+
+@tool
 def get_session_context(session_id: str) -> str:
-    """Retrieves everything saved for a PAST observation session by its
-    id: weather, visibility, recommendations, field-of-view analysis, and
-    schedule. Use when the user asks about a specific past plan, or asks
-    "why" something was or wasn't recommended and the answer requires
-    looking at saved reasoning rather than guessing. Session ids are
+    """Retrieves a summary of a PAST observation session by its id:
+    per-night sky quality verdict and the top-scored recommended objects
+    with their factor breakdown (visibility, weather, moon, equipment,
+    light pollution). Use when the user asks about a specific past plan,
+    or asks "why" something was or wasn't recommended. Session ids are
     listed in the system context — look there before asking the user."""
     result = storage.get_full_session(session_id)
     if not result or not result.get("session"):
         return f"No session found with id {session_id}."
-    return json.dumps(result, default=str)
+    return json.dumps(_trim_session_for_chat(result), default=str)
 
 
 @tool
@@ -210,7 +329,7 @@ def get_recent_sessions(limit: int = 5, config: RunnableConfig = None) -> str:
 
 
 def build_tools() -> list:
-    return [create_observation_plan, get_session_context, get_recent_sessions]
+    return [create_observation_plan, revise_observation_plan, get_session_context, get_recent_sessions]
 
 
 # ---------------------------------------------------------------------
@@ -234,7 +353,10 @@ def dynamic_prompt(state, config) -> list:
         "You are AstroPlanner, an astronomy observation planning assistant. "
         "You never perform astronomy calculations yourself — always call a "
         "tool for weather, visibility, recommendations, or schedules rather "
-        "than estimating or guessing them."
+        "than estimating or guessing them. If the user wants a brand new "
+        "plan, use create_observation_plan. If they want to redo/regenerate "
+        "an existing plan, use revise_observation_plan instead, so it's "
+        "saved as a linked revision rather than an unrelated new session."
     )
 
     if user_id:
