@@ -25,6 +25,7 @@ just diffing:
 """
 
 import os
+import json
 from datetime import date
 
 from langchain_core.tools import tool
@@ -95,7 +96,7 @@ def create_observation_plan(
     pixel_size_um: float = None,
     bortle_scale: int = None,
     notes: str = None,
-) -> dict:
+) -> str:
     """Runs the full observation-planning pipeline (weather, visibility,
     recommendations, field-of-view, and a night-by-night schedule) for a
     location and telescope, and saves every stage as a new Observation
@@ -146,33 +147,43 @@ def create_observation_plan(
     weekly_schedule = scheduler.get_weekly_schedule(weekly_fov)
     storage.save_stage_result(session_id, "schedule", weekly_schedule)
 
-    return {
+    # Groq's tool-message parser rejects content that isn't a non-empty
+    # string (e.g. a raw dict, or "[]") — every tool below returns a JSON
+    # string instead of a Python object for this reason, with an explicit
+    # fallback message when a result would otherwise be empty.
+    return json.dumps({
         "session_id": session_id,
         "setup_summary": setup_summary,
         "schedule_preview": _trim_schedule_for_chat(weekly_schedule),
         "note": "Full 7-night data is saved under this session_id — call get_session_context for more.",
-    }
+    }, default=str)
 
 
 @tool
-def get_session_context(session_id: str) -> dict:
+def get_session_context(session_id: str) -> str:
     """Retrieves everything saved for a PAST observation session by its
     id: weather, visibility, recommendations, field-of-view analysis, and
     schedule. Use when the user asks about a specific past plan, or asks
     "why" something was or wasn't recommended and the answer requires
     looking at saved reasoning rather than guessing. Session ids are
     listed in the system context — look there before asking the user."""
-    return storage.get_full_session(session_id)
+    result = storage.get_full_session(session_id)
+    if not result or not result.get("session"):
+        return f"No session found with id {session_id}."
+    return json.dumps(result, default=str)
 
 
 @tool
-def get_recent_sessions(user_name: str, limit: int = 5) -> list:
+def get_recent_sessions(user_name: str, limit: int = 5) -> str:
     """Lists a user's recent observation sessions (id, location, date,
     revision number) without their full data. Use this to find a
     session_id before calling get_session_context, or to answer
     "what have I planned recently" without loading everything."""
     user_id = storage.get_or_create_user(user_name)
-    return storage.list_recent_sessions(user_id, limit=limit)
+    sessions = storage.list_recent_sessions(user_id, limit=limit)
+    if not sessions:
+        return "No past sessions found for this user."
+    return json.dumps(sessions, default=str)
 
 
 def build_tools() -> list:
