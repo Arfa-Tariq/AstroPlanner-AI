@@ -29,11 +29,53 @@ import json
 from datetime import date
 
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, RemoveMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
+
+# ---------------------------------------------------------------------
+# Checkpointer: Postgres (Supabase) if DATABASE_URL is set, else in-memory.
+#
+# MemorySaver keeps conversation state only in this Python process — a
+# Colab runtime restart wipes it, even though everything ELSE (sessions,
+# equipment, messages, summaries) is already safely in Supabase via
+# storage.py. This closes that gap by pointing LangGraph's own
+# checkpointer at the same Postgres instance.
+#
+# Note this is a DIFFERENT connection path than storage.py: storage.py
+# talks to Supabase's REST/PostgREST layer via the supabase-py client
+# (good for typed row CRUD, RLS-aware). The checkpointer needs raw SQL
+# access to manage its own checkpoint tables, which only a direct
+# Postgres connection provides — hence a separate DATABASE_URL env var
+# (Project Settings -> Database -> Connection string), distinct from
+# SUPABASE_URL/SUPABASE_KEY.
+# ---------------------------------------------------------------------
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if DATABASE_URL:
+    from langgraph.checkpoint.postgres import PostgresSaver
+    from psycopg_pool import ConnectionPool
+
+    # prepare_threshold=0 disables prepared statements — REQUIRED against
+    # Supabase's pooled connection (pgbouncer, transaction mode), which
+    # doesn't support them. Without this, the first checkpoint write
+    # fails with an unhelpful protocol-level error.
+    _connection_pool = ConnectionPool(
+        conninfo=DATABASE_URL,
+        max_size=5,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+    )
+    checkpointer = PostgresSaver(_connection_pool)
+    checkpointer.setup()  # idempotent — creates checkpoint tables on first run, no-ops after
+else:
+    print(
+        "WARNING: DATABASE_URL not set — falling back to in-memory checkpointing. "
+        "Conversation state will NOT survive a runtime restart. Set DATABASE_URL "
+        "(Supabase: Project Settings -> Database -> Connection string, URI tab) to fix this."
+    )
+    checkpointer = MemorySaver()
 
 import weather
 import recommendation
@@ -380,8 +422,62 @@ agent = create_react_agent(
     model=llm,
     tools=build_tools(),
     prompt=dynamic_prompt,
-    checkpointer=MemorySaver(),
+    checkpointer=checkpointer,
 )
+
+
+# Once a thread's raw message count passes this, everything except the
+# last KEEP_LAST_N_MESSAGES is condensed into one summary and removed
+# from graph state. Deliberately small here to make the behavior easy to
+# observe while testing — raise both once you trust it (e.g. 20 / 6).
+SUMMARIZE_AFTER_N_MESSAGES = 12
+KEEP_LAST_N_MESSAGES = 4
+
+
+def _summarize_and_trim(thread_id: str, conversation_id: str) -> None:
+    """
+    Keeps one thread's graph state bounded. MemorySaver keeps every
+    message in a thread forever by default — dynamic_prompt only
+    controls the system message, the full raw history (including big
+    tool outputs) still gets resent to Groq every turn regardless. THIS
+    is the actual mechanism behind both the 413 and 429 errors earlier:
+    token cost per turn was growing, not constant.
+
+    Called at the start of every chat() turn, before the new message is
+    added. If history is still short, this is a no-op (one cheap
+    get_state call). Once it's long: everything except the most recent
+    KEEP_LAST_N_MESSAGES is sent to the LLM for a short summary, that
+    summary is persisted to Supabase (conversation_summaries — the table
+    that's existed in the schema since the start but had no writer
+    until now), and the old messages are deleted from graph state via
+    RemoveMessage — not hidden from the prompt, actually removed from
+    what gets sent next turn.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    current_state = agent.get_state(config)
+    messages = current_state.values.get("messages", [])
+
+    if len(messages) <= SUMMARIZE_AFTER_N_MESSAGES:
+        return
+
+    to_summarize = messages[:-KEEP_LAST_N_MESSAGES]
+    to_keep = messages[-KEEP_LAST_N_MESSAGES:]
+
+    transcript = "\n".join(
+        f"{m.type}: {m.content}" for m in to_summarize if isinstance(m.content, str) and m.content
+    )
+    summary_prompt = (
+        "Summarize this astronomy-planning conversation in 3-5 sentences. "
+        "Keep any session_ids, locations, or equipment details mentioned "
+        "— they may be needed later. Be concise.\n\n" + transcript
+    )
+    summary = llm.invoke(summary_prompt).content
+
+    storage.save_conversation_summary(conversation_id, summary)
+
+    removals = [RemoveMessage(id=m.id) for m in to_summarize if m.id is not None]
+    summary_message = SystemMessage(content=f"[Earlier conversation summary]: {summary}")
+    agent.update_state(config, {"messages": removals + [summary_message]})
 
 
 def chat(user_message: str, user_name: str = "chat_user", thread_id: str = "default") -> str:
@@ -393,14 +489,28 @@ def chat(user_message: str, user_name: str = "chat_user", thread_id: str = "defa
     tool call and dynamic_prompt invocation in this thread can look up
     "who is this" via RunnableConfig instead of asking the model to
     infer or supply it.
+
+    Also persists both sides of the turn to Supabase (messages table) —
+    independent of LangGraph's own checkpointed state, so conversation
+    history survives even if MemorySaver's in-memory store is ever
+    swapped out or the process restarts.
     """
     if thread_id not in _thread_identity_cache:
         user_id = storage.get_or_create_user(user_name)
         _thread_identity_cache[thread_id] = {"user_id": user_id, "user_name": user_name}
+    user_id = _thread_identity_cache[thread_id]["user_id"]
+
+    conversation_id = storage.get_or_create_conversation(user_id, thread_id)
+    _summarize_and_trim(thread_id, conversation_id)
 
     config = {"configurable": {"thread_id": thread_id}}
     result = agent.invoke({"messages": [{"role": "user", "content": user_message}]}, config)
-    return result["messages"][-1].content
+    reply = result["messages"][-1].content
+
+    storage.save_message(conversation_id, "user", user_message)
+    storage.save_message(conversation_id, "assistant", reply)
+
+    return reply
 
 
 if __name__ == "__main__":
