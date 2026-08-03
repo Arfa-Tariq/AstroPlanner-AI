@@ -62,10 +62,22 @@ if DATABASE_URL:
     # Supabase's pooled connection (pgbouncer, transaction mode), which
     # doesn't support them. Without this, the first checkpoint write
     # fails with an unhelpful protocol-level error.
+    def _configure_connection(conn):
+        # prepare_threshold is a Connection ATTRIBUTE, not a psycopg.connect()
+        # parameter — passing it inside connect kwargs (the previous version
+        # of this code) is silently ignored, which is exactly what caused
+        # the DuplicatePreparedStatement error: psycopg's default auto-prepare
+        # behavior stayed on and collided with Supabase's pgbouncer pooler,
+        # which doesn't support server-side prepared statements at all. This
+        # `configure` callback runs against every new connection the pool
+        # opens, which is the correct place to set it.
+        conn.autocommit = True
+        conn.prepare_threshold = None  # None fully disables auto-prepare; 0 does not
+
     _connection_pool = ConnectionPool(
         conninfo=DATABASE_URL,
         max_size=5,
-        kwargs={"autocommit": True, "prepare_threshold": 0},
+        configure=_configure_connection,
     )
     checkpointer = PostgresSaver(_connection_pool)
     checkpointer.setup()  # idempotent — creates checkpoint tables on first run, no-ops after
