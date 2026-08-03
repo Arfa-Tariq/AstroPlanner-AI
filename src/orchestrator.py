@@ -84,6 +84,7 @@ import scheduler
 from visibility import VisibilityEngine
 from models import UserProfile
 import storage
+import knowledge
 
 llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.environ["GROQ_API_KEY"])
 
@@ -370,8 +371,28 @@ def get_recent_sessions(limit: int = 5, config: RunnableConfig = None) -> str:
     return json.dumps(sessions, default=str)
 
 
+@tool
+def search_knowledge_base(query: str, match_count: int = 3) -> str:
+    """Searches general astronomy knowledge (object descriptions, terms
+    like seeing/transparency/Bortle scale, imaging concepts) — NOT
+    observation history. Use for questions like "tell me about the Orion
+    Nebula" or "what does seeing mean", where the answer is astronomy
+    knowledge rather than something from the user's own sessions. Do NOT
+    use this for "why was X recommended in my plan" — that's
+    get_session_context instead, since the answer depends on the user's
+    actual saved data, not general knowledge."""
+    query_embedding = knowledge.embed_text(query)
+    results = storage.search_knowledge_base(query_embedding, match_count=match_count)
+    if not results:
+        return "No relevant knowledge base entries found for this query."
+    return json.dumps(results, default=str)
+
+
 def build_tools() -> list:
-    return [create_observation_plan, revise_observation_plan, get_session_context, get_recent_sessions]
+    return [
+        create_observation_plan, revise_observation_plan,
+        get_session_context, get_recent_sessions, search_knowledge_base,
+    ]
 
 
 # ---------------------------------------------------------------------
@@ -398,7 +419,10 @@ def dynamic_prompt(state, config) -> list:
         "than estimating or guessing them. If the user wants a brand new "
         "plan, use create_observation_plan. If they want to redo/regenerate "
         "an existing plan, use revise_observation_plan instead, so it's "
-        "saved as a linked revision rather than an unrelated new session."
+        "saved as a linked revision rather than an unrelated new session. "
+        "For general astronomy questions not about the user's own sessions "
+        "(e.g. \"what is the Orion Nebula\"), use search_knowledge_base "
+        "rather than answering from memory."
     )
 
     if user_id:
