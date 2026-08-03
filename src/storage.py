@@ -1,479 +1,294 @@
 """
-AstroPlanner — Orchestrator (LangGraph + Supabase)
+AstroPlanner — Session Storage (Supabase)
 
-Two fixes over the previous version, worth understanding rather than
-just diffing:
+Replaces the psycopg/generic-table version. Two real changes, not just a
+different client library:
 
-1. STALE PROMPT BUG: the old code built the system prompt once, at
-   import time (`prompt=build_system_prompt()`), before any session
-   existed. LangGraph's create_react_agent lets `prompt` be a CALLABLE
-   instead of a fixed string — `dynamic_prompt(state, config)` below is
-   invoked fresh on every turn, so "recent sessions" always reflects
-   what's actually in Supabase right now. This callable IS the context
-   builder from the architecture doc — it's not a separate graph node
-   because nothing else needs to happen between "message arrives" and
-   "agent runs" for this app's scope.
+1. Typed tables per pipeline stage instead of one generic
+   (session_id, tool_name, result_json) table — see db/supabase_schema.sql
+   for the reasoning. This file's functions map 1:1 onto those tables.
 
-2. PIPELINE AS ONE TOOL: rather than five separate stage tools the LLM
-   would have to call in the right order (risk: it calls fov before
-   recommendation, or forgets scheduler), `create_observation_plan` runs
-   weather -> visibility -> recommendation -> fov -> scheduler
-   server-side as one unit and persists every stage to Supabase. This
-   matches the guide's own pipeline diagram, where "Pipeline Executes"
-   is one block from the user's perspective. Narrower follow-up
-   questions get their own tools instead of re-running everything.
+2. Session revisions are now a first-class concept: create_session()
+   accepts an optional parent_session_id, and revision_number is derived
+   automatically (count of existing children + 1) rather than left for
+   the caller to track by hand.
+
+Uses the supabase-py client (table-builder API) rather than raw SQL —
+this is the idiomatic way to talk to Supabase from Python, and it's what
+you want if Auth / Row Level Security get added later, since the client
+understands both.
+
+Requires: pip install supabase
+Requires env vars: SUPABASE_URL, SUPABASE_KEY (service-role key for a
+backend process like this one — never ship the service-role key to a
+browser client).
 """
 
 import os
-import json
-from datetime import date
+from typing import Optional
 
-from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, RemoveMessage
-from langchain_core.runnables import RunnableConfig
-from langchain_groq import ChatGroq
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver
+from supabase import create_client, Client
 
-import weather
-import recommendation
-import fov as fov_module
-import scheduler
-from visibility import VisibilityEngine
 from models import UserProfile
-import storage
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.environ["GROQ_API_KEY"])
-
-DATA_DIR = os.environ.get("ASTROPLANNER_DATA_DIR", "./data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# Caches — same "build once per conversation, not once per call" idea as
-# VisibilityEngine's own internal ephemeris/catalog caching. Keyed so
-# multiple users/locations in the same process don't collide or
-# needlessly re-download the NGC catalog.
-_visibility_engine_cache: dict = {}
-
-# thread_id -> {"user_id": ..., "user_name": ...}. Identity is resolved
-# ONCE per thread_id inside chat() (from a real Python argument, not from
-# conversation text) and looked up here by tools/prompt via RunnableConfig
-# — never asked of the LLM. A tool parameter like `user_name` would force
-# the model to infer identity from the message text, which it can't do
-# reliably (nothing in "what have I planned recently?" says who "I" is),
-# and a wrong guess silently creates a phantom user in Supabase with zero
-# sessions. This is the fix for exactly that bug.
-_thread_identity_cache: dict[str, dict] = {}
+_client: Optional[Client] = None
 
 
-def get_or_build_visibility_engine(latitude: float, longitude: float, aperture_mm: float) -> VisibilityEngine:
-    key = (latitude, longitude, aperture_mm)
-    if key not in _visibility_engine_cache:
-        _visibility_engine_cache[key] = VisibilityEngine(latitude, longitude, aperture_mm, data_dir=DATA_DIR)
-    return _visibility_engine_cache[key]
-
-
-def _trim_schedule_for_chat(weekly_schedule: list, max_nights: int = 1) -> list:
+def get_client() -> Client:
     """
-    Schedules are already compact, but Groq's free tier caps requests at
-    12,000 tokens/minute — small enough that even 3 nights with prose
-    'note' fields can blow past it, especially once conversation history
-    accumulates across turns. Trimmed hard: 1 night, and the long-form
-    'note' string dropped from each slot (full data is always still in
-    Supabase via session_id — call get_session_context for it).
+    Lazily creates one Supabase client and reuses it — same "build once"
+    principle as VisibilityEngine's ephemeris loading, just for a network
+    client instead of a large local file.
     """
-    trimmed = []
-    for night in weekly_schedule[:max_nights]:
-        def strip_note(slot):
-            return {k: v for k, v in slot.items() if k != "note"}
-        trimmed.append({
-            "date": night["date"],
-            "timeline": [strip_note(s) for s in night["timeline"]],
-            "daytime_bonus": [strip_note(s) for s in night["daytime_bonus"]],
-        })
-    return trimmed
+    global _client
+    if _client is None:
+        _client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    return _client
 
 
 # ---------------------------------------------------------------------
-# Tools
+# Users + equipment
 # ---------------------------------------------------------------------
 
-def _run_pipeline(user: UserProfile, session_id: str) -> dict:
+def get_or_create_user(name: str) -> str:
+    """Returns the user's id, creating a row if this name hasn't been seen.
+    Simple name-based lookup for now — swap for Supabase Auth's user id
+    once the app has real accounts instead of a single chat_user."""
+    client = get_client()
+    existing = client.table("users").select("id").eq("name", name).limit(1).execute()
+    if existing.data:
+        return existing.data[0]["id"]
+    created = client.table("users").insert({"name": name}).execute()
+    return created.data[0]["id"]
+
+
+def save_equipment(user_id: str, user: UserProfile, label: str = "default") -> str:
     """
-    The actual weather -> visibility -> recommendation -> fov -> scheduler
-    pipeline, saving each stage to Supabase under session_id. Extracted
-    out of create_observation_plan so revise_observation_plan can call the
-    exact same logic against a NEW session that's linked back to an
-    existing one via parent_session_id, instead of duplicating the
-    5-stage sequence. Returns the data needed for a trimmed chat reply.
+    Stores a snapshot of the user's telescope/camera/mount/preferences.
+    Always inserts a new row rather than updating in place — past
+    sessions should keep pointing at the equipment_id that was actually
+    used at the time, even if the user's gear changes later.
     """
-    engine = get_or_build_visibility_engine(user.latitude, user.longitude, user.telescope.aperture_mm)
-
-    weekly_weather = weather.get_weekly_sky_conditions(user, date.today())
-    storage.save_stage_result(session_id, "weather", weekly_weather)
-
-    weekly_visibility = engine.get_weekly_visibility(date.today())
-    storage.save_stage_result(session_id, "visibility", weekly_visibility)
-
-    weekly_recommendations = recommendation.get_weekly_recommendations(
-        user, weekly_weather, weekly_visibility, user.bortle_scale, engine.ts, engine.eph,
-    )
-    storage.save_stage_result(session_id, "recommendation", weekly_recommendations)
-
-    weekly_fov, setup_summary = fov_module.get_weekly_fov_analysis(weekly_recommendations, user)
-    storage.save_stage_result(session_id, "fov", {"nights": weekly_fov, "setup_summary": setup_summary})
-
-    weekly_schedule = scheduler.get_weekly_schedule(weekly_fov, max_objects=8)
-    storage.save_stage_result(session_id, "schedule", weekly_schedule)
-
-    return {"setup_summary": setup_summary, "weekly_schedule": weekly_schedule}
+    client = get_client()
+    row = {
+        "user_id": user_id,
+        "label": label,
+        "telescope": user.telescope.model_dump(mode="json"),
+        "camera": user.camera.model_dump(mode="json") if user.camera else None,
+        "mount": user.mount.model_dump(mode="json") if user.mount else None,
+        "experience_level": user.experience_level.value,
+        "bortle_scale": user.bortle_scale,
+        "preferences": user.preferences.model_dump(mode="json") if user.preferences else None,
+    }
+    created = client.table("equipment").insert(row).execute()
+    return created.data[0]["id"]
 
 
-@tool
-def create_observation_plan(
+def get_equipment(equipment_id: str) -> Optional[dict]:
+    """
+    Reads back one equipment snapshot — the raw row, not a UserProfile
+    (that reconstruction needs latitude/longitude too, which live on the
+    session, not the equipment row, so the caller assembles UserProfile
+    itself). Needed for session revisions: "run this again" should reuse
+    the exact telescope/camera the original session used, not ask the
+    user to re-enter specs.
+    """
+    client = get_client()
+    rows = client.table("equipment").select("*").eq("id", equipment_id).limit(1).execute()
+    return rows.data[0] if rows.data else None
+
+
+# ---------------------------------------------------------------------
+# Observation sessions
+# ---------------------------------------------------------------------
+
+def create_session(
+    user_id: str,
     latitude: float,
     longitude: float,
-    aperture_mm: float,
-    focal_length_mm: float,
-    experience_level: str = "beginner",
-    sensor_width_mm: float = None,
-    sensor_height_mm: float = None,
-    pixel_size_um: float = None,
-    bortle_scale: int = None,
-    notes: str = None,
-    config: RunnableConfig = None,
+    generated_at: str,
+    equipment_id: Optional[str] = None,
+    notes: Optional[str] = None,
+    parent_session_id: Optional[str] = None,
 ) -> str:
-    """Runs the full observation-planning pipeline (weather, visibility,
-    recommendations, field-of-view, and a night-by-night schedule) for a
-    location and telescope, and saves every stage as a new Observation
-    Session. Use this when the user wants a NEW plan for a location/setup
-    not seen before, e.g. "plan my observing session for this week" or
-    "what should I look at tonight from [location]". If the user instead
-    wants to redo or tweak an EXISTING plan (e.g. "regenerate with fewer
-    targets"), use revise_observation_plan instead. Ask for
-    latitude/longitude and aperture_mm if not given — do not guess
-    coordinates. sensor_* / pixel_size_um are only needed for
-    astrophotography; omit them for visual-only observing. Do NOT ask the
-    user to identify themselves — identity is resolved automatically."""
-    thread_id = config["configurable"]["thread_id"]
-    identity = _thread_identity_cache.get(thread_id)
-    if identity is None:
-        return "No user identity bound to this conversation — this is a setup bug, not something to ask the user about."
-    user_id, user_name = identity["user_id"], identity["user_name"]
-
-    stub_camera = None
-    if sensor_width_mm and sensor_height_mm and pixel_size_um:
-        stub_camera = {
-            "sensor_width_mm": sensor_width_mm,
-            "sensor_height_mm": sensor_height_mm,
-            "pixel_size_um": pixel_size_um,
-        }
-
-    user = UserProfile(
-        name=user_name, latitude=latitude, longitude=longitude,
-        experience_level=experience_level, bortle_scale=bortle_scale,
-        telescope={"aperture_mm": aperture_mm, "focal_length_mm": focal_length_mm},
-        camera=stub_camera,
-    )
-
-    equipment_id = storage.save_equipment(user_id, user)
-    session_id = storage.create_session(
-        user_id=user_id, latitude=latitude, longitude=longitude,
-        generated_at=date.today().isoformat(), equipment_id=equipment_id, notes=notes,
-    )
-
-    pipeline_result = _run_pipeline(user, session_id)
-
-    # Groq's tool-message parser rejects content that isn't a non-empty
-    # string (e.g. a raw dict, or "[]") — every tool below returns a JSON
-    # string instead of a Python object for this reason, with an explicit
-    # fallback message when a result would otherwise be empty.
-    return json.dumps({
-        "session_id": session_id,
-        "setup_summary": pipeline_result["setup_summary"],
-        "schedule_preview": _trim_schedule_for_chat(pipeline_result["weekly_schedule"]),
-        "note": "Full 7-night data is saved under this session_id — call get_session_context for more.",
-    }, default=str)
-
-
-@tool
-def revise_observation_plan(parent_session_id: str, notes: str = None, config: RunnableConfig = None) -> str:
-    """Re-runs the observation-planning pipeline for the SAME location and
-    equipment as an existing session, saving the result as a new revision
-    linked back to it. Use this when the user wants to redo, regenerate,
-    or update a plan they already have — e.g. "regenerate tonight's plan"
-    or "run that again" — rather than create_observation_plan, which
-    would start an unrelated fresh session. Find parent_session_id via
-    get_recent_sessions or the session list already in context."""
-    thread_id = config["configurable"]["thread_id"]
-    identity = _thread_identity_cache.get(thread_id)
-    if identity is None:
-        return "No user identity bound to this conversation — this is a setup bug, not something to ask the user about."
-    user_id, user_name = identity["user_id"], identity["user_name"]
-
-    parent = storage.get_full_session(parent_session_id)
-    parent_meta = (parent or {}).get("session")
-    if not parent_meta:
-        return f"No session found with id {parent_session_id} — cannot create a revision of it."
-
-    equipment = storage.get_equipment(parent_meta["equipment_id"]) if parent_meta.get("equipment_id") else None
-    if not equipment:
-        return f"Session {parent_session_id} has no equipment on file — cannot revise it. Use create_observation_plan instead."
-
-    user = UserProfile(
-        name=user_name,
-        latitude=parent_meta["latitude"], longitude=parent_meta["longitude"],
-        experience_level=equipment["experience_level"], bortle_scale=equipment.get("bortle_scale"),
-        telescope=equipment["telescope"], camera=equipment.get("camera"),
-        mount=equipment.get("mount"), preferences=equipment.get("preferences"),
-    )
-
-    session_id = storage.create_session(
-        user_id=user_id, latitude=user.latitude, longitude=user.longitude,
-        generated_at=date.today().isoformat(), equipment_id=parent_meta["equipment_id"],
-        notes=notes, parent_session_id=parent_session_id,
-    )
-
-    pipeline_result = _run_pipeline(user, session_id)
-
-    return json.dumps({
-        "session_id": session_id,
-        "revision_of": parent_session_id,
-        "setup_summary": pipeline_result["setup_summary"],
-        "schedule_preview": _trim_schedule_for_chat(pipeline_result["weekly_schedule"]),
-        "note": "This is a new revision linked to the original session — call get_session_context for more.",
-    }, default=str)
-
-
-def _trim_session_for_chat(full_session: dict, max_nights: int = 2, top_n_objects: int = 5) -> dict:
     """
-    get_full_session returns EVERYTHING (all 7 nights, every raw field —
-    hourly weather, every catalog candidate's ra/dec, etc). That's correct
-    for Supabase storage but far too large for a chat turn — one real call
-    requested 83k tokens against Groq's per-request limit. Trims to what a
-    "why was X recommended" question actually needs: per-night verdict +
-    top-N scored objects with their factor breakdown, for the first
-    max_nights nights. Full data is still in Supabase if a deeper look is
-    ever needed.
+    Starts a new Observation Session. If parent_session_id is given, this
+    is a revision of that session — revision_number is computed as
+    (number of existing children of that parent) + 2 (the parent counts
+    as revision 1), so callers never have to track the count themselves.
     """
-    session = full_session.get("session") or {}
-    recommendation = full_session.get("recommendation") or []
-    fov = (full_session.get("fov") or {}).get("nights") or []
-    fov_by_date = {n["date"]: n for n in fov}
+    client = get_client()
 
-    nights_out = []
-    for night in recommendation[:max_nights]:
-        fov_night = fov_by_date.get(night["date"])
-        fov_objects_by_name = (
-            {o["name"]: o.get("fov_analysis") for o in fov_night["recommended_objects"]}
-            if fov_night else {}
+    revision_number = 1
+    if parent_session_id is not None:
+        siblings = (
+            client.table("observation_sessions")
+            .select("id", count="exact")
+            .eq("parent_session_id", parent_session_id)
+            .execute()
         )
+        revision_number = (siblings.count or 0) + 2
 
-        objects_out = []
-        for obj in night["recommended_objects"][:top_n_objects]:
-            fov_info = fov_objects_by_name.get(obj["name"], {})
-            objects_out.append({
-                "name": obj.get("name"),
-                "common_name": obj.get("common_name"),
-                "target_type": obj.get("target_type"),
-                "recommendation_score": obj.get("recommendation_score"),
-                "factor_scores": obj.get("factor_scores"),
-                "fov_fit": fov_info.get("fov_fit") if fov_info else None,
-            })
+    row = {
+        "user_id": user_id,
+        "equipment_id": equipment_id,
+        "parent_session_id": parent_session_id,
+        "revision_number": revision_number,
+        "latitude": latitude,
+        "longitude": longitude,
+        "generated_at": generated_at,
+        "notes": notes,
+    }
+    created = client.table("observation_sessions").insert(row).execute()
+    return created.data[0]["id"]
 
-        nights_out.append({
-            "date": night["date"],
-            "moon_illumination_pct": night.get("moon_illumination_pct"),
-            "sky_quality_verdict": night.get("sky_quality_verdict"),
-            "top_recommended_objects": objects_out,
-        })
+
+_STAGE_TABLES = {
+    "weather": "weather_analyses",
+    "visibility": "visibility_analyses",
+    "recommendation": "recommendation_analyses",
+    "fov": "fov_analyses",
+    "schedule": "observation_schedules",
+}
+
+
+def save_stage_result(session_id: str, stage: str, result) -> None:
+    """
+    Attaches one pipeline stage's output to a session. `stage` must be one
+    of weather/visibility/recommendation/fov/schedule — this is the single
+    write path every tool wrapper in orchestrator.py calls after running
+    its computation, so the mapping from stage name to table lives in
+    exactly one place.
+    """
+    if stage not in _STAGE_TABLES:
+        raise ValueError(f"Unknown stage '{stage}'. Expected one of {list(_STAGE_TABLES)}.")
+    client = get_client()
+    client.table(_STAGE_TABLES[stage]).insert({
+        "session_id": session_id,
+        "result": result,
+    }).execute()
+
+
+def get_latest_stage_result(session_id: str, stage: str) -> Optional[dict]:
+    """Most recent result for one stage of one session, or None if that
+    stage hasn't been run yet for this session."""
+    if stage not in _STAGE_TABLES:
+        raise ValueError(f"Unknown stage '{stage}'. Expected one of {list(_STAGE_TABLES)}.")
+    client = get_client()
+    rows = (
+        client.table(_STAGE_TABLES[stage])
+        .select("result, created_at")
+        .eq("session_id", session_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return rows.data[0]["result"] if rows.data else None
+
+
+def get_full_session(session_id: str) -> dict:
+    """
+    Everything known about one session: its metadata plus the latest
+    result from every stage that has run so far. This is what a tool
+    like get_past_session_results hands back to the LLM — one call
+    instead of five.
+    """
+    client = get_client()
+    session_row = client.table("observation_sessions").select("*").eq("id", session_id).single().execute()
 
     return {
-        "session_id": session.get("id"),
-        "latitude": session.get("latitude"),
-        "longitude": session.get("longitude"),
-        "generated_at": session.get("generated_at"),
-        "revision_number": session.get("revision_number"),
-        "nights": nights_out,
-        "note": f"Showing top {top_n_objects} objects for the first {max_nights} night(s) only — full data is in Supabase under this session_id.",
+        "session": session_row.data,
+        "weather": get_latest_stage_result(session_id, "weather"),
+        "visibility": get_latest_stage_result(session_id, "visibility"),
+        "recommendation": get_latest_stage_result(session_id, "recommendation"),
+        "fov": get_latest_stage_result(session_id, "fov"),
+        "schedule": get_latest_stage_result(session_id, "schedule"),
     }
 
 
-@tool
-def get_session_context(session_id: str) -> str:
-    """Retrieves a summary of a PAST observation session by its id:
-    per-night sky quality verdict and the top-scored recommended objects
-    with their factor breakdown (visibility, weather, moon, equipment,
-    light pollution). Use when the user asks about a specific past plan,
-    or asks "why" something was or wasn't recommended. Session ids are
-    listed in the system context — look there before asking the user."""
-    result = storage.get_full_session(session_id)
-    if not result or not result.get("session"):
-        return f"No session found with id {session_id}."
-    return json.dumps(_trim_session_for_chat(result), default=str)
+def list_recent_sessions(user_id: str, limit: int = 10) -> list[dict]:
+    """
+    Lightweight session list (metadata only, no stage results) — safe to
+    put directly into the system prompt so the model KNOWS past sessions
+    exist without the token cost of their full contents. The model calls
+    get_full_session with an id from here if the user asks about one.
+    """
+    client = get_client()
+    rows = (
+        client.table("observation_sessions")
+        .select("id, latitude, longitude, generated_at, revision_number, notes, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return rows.data
 
 
-@tool
-def get_recent_sessions(limit: int = 5, config: RunnableConfig = None) -> str:
-    """Lists the current user's recent observation sessions (id, location,
-    date, revision number) without their full data. Use this to find a
-    session_id before calling get_session_context, or to answer
-    "what have I planned recently" without loading everything."""
-    thread_id = config["configurable"]["thread_id"]
-    identity = _thread_identity_cache.get(thread_id)
-    if identity is None:
-        return "No user identity bound to this conversation — this is a setup bug, not something to ask the user about."
-    sessions = storage.list_recent_sessions(identity["user_id"], limit=limit)
-    if not sessions:
-        return "No past sessions found for this user."
-    return json.dumps(sessions, default=str)
-
-
-def build_tools() -> list:
-    return [create_observation_plan, revise_observation_plan, get_session_context, get_recent_sessions]
+def get_most_recent_session(user_id: str) -> Optional[dict]:
+    sessions = list_recent_sessions(user_id, limit=1)
+    return sessions[0] if sessions else None
 
 
 # ---------------------------------------------------------------------
-# Dynamic context builder — see module docstring, fix #1
+# Conversation memory
 # ---------------------------------------------------------------------
 
-def dynamic_prompt(state, config) -> list:
-    """
-    Called by create_react_agent on every turn (not once at startup).
-    Builds a minimal system message: a short list of the user's recent
-    sessions, cheap enough to include always, with full data one tool
-    call away via get_session_context. This is the "context should
-    always be minimal and relevant" principle from the architecture doc,
-    implemented as a prompt function instead of a separate graph node.
-    """
-    thread_id = config.get("configurable", {}).get("thread_id")
-    identity = _thread_identity_cache.get(thread_id)
-    user_id = identity["user_id"] if identity else None
+def get_or_create_conversation(user_id: str, thread_id: str, session_id: Optional[str] = None) -> str:
+    """thread_id is the LangGraph checkpointer's key — this table also
+    persists conversations to Supabase for history/summarization,
+    independent of LangGraph's own checkpointed state."""
+    client = get_client()
+    existing = client.table("conversations").select("id").eq("thread_id", thread_id).limit(1).execute()
+    if existing.data:
+        return existing.data[0]["id"]
+    created = client.table("conversations").insert({
+        "user_id": user_id, "thread_id": thread_id, "session_id": session_id,
+    }).execute()
+    return created.data[0]["id"]
 
-    base = (
-        "You are AstroPlanner, an astronomy observation planning assistant. "
-        "You never perform astronomy calculations yourself — always call a "
-        "tool for weather, visibility, recommendations, or schedules rather "
-        "than estimating or guessing them. If the user wants a brand new "
-        "plan, use create_observation_plan. If they want to redo/regenerate "
-        "an existing plan, use revise_observation_plan instead, so it's "
-        "saved as a linked revision rather than an unrelated new session."
+
+def save_message(conversation_id: str, role: str, content: str) -> None:
+    client = get_client()
+    client.table("messages").insert({
+        "conversation_id": conversation_id, "role": role, "content": content,
+    }).execute()
+
+
+def save_conversation_summary(conversation_id: str, summary: str) -> None:
+    client = get_client()
+    client.table("conversation_summaries").insert({
+        "conversation_id": conversation_id, "summary": summary,
+    }).execute()
+
+
+def get_latest_conversation_summary(conversation_id: str) -> Optional[str]:
+    client = get_client()
+    rows = (
+        client.table("conversation_summaries")
+        .select("summary")
+        .eq("conversation_id", conversation_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
     )
-
-    if user_id:
-        recent = storage.list_recent_sessions(user_id, limit=5)
-        if recent:
-            lines = [
-                f"- session_id={s['id']}, {s['generated_at']}, "
-                f"lat={s['latitude']}, lon={s['longitude']}, rev={s['revision_number']}"
-                for s in recent
-            ]
-            base += (
-                "\n\nThis user has these recent sessions (call get_session_context "
-                "only if the user asks about one — don't mention them unprompted):\n"
-                + "\n".join(lines)
-            )
-
-    return [SystemMessage(content=base)] + state["messages"]
+    return rows.data[0]["summary"] if rows.data else None
 
 
-agent = create_react_agent(
-    model=llm,
-    tools=build_tools(),
-    prompt=dynamic_prompt,
-    checkpointer=MemorySaver(),
-)
+# ---------------------------------------------------------------------
+# Semantic memory (pgvector) — see db/supabase_schema.sql: match_knowledge_base
+# ---------------------------------------------------------------------
 
-
-# Once a thread's raw message count passes this, everything except the
-# last KEEP_LAST_N_MESSAGES is condensed into one summary and removed
-# from graph state. Deliberately small here to make the behavior easy to
-# observe while testing — raise both once you trust it (e.g. 20 / 6).
-SUMMARIZE_AFTER_N_MESSAGES = 12
-KEEP_LAST_N_MESSAGES = 4
-
-
-def _summarize_and_trim(thread_id: str, conversation_id: str) -> None:
+def search_knowledge_base(query_embedding: list[float], match_count: int = 5) -> list[dict]:
     """
-    Keeps one thread's graph state bounded. MemorySaver keeps every
-    message in a thread forever by default — dynamic_prompt only
-    controls the system message, the full raw history (including big
-    tool outputs) still gets resent to Groq every turn regardless. THIS
-    is the actual mechanism behind both the 413 and 429 errors earlier:
-    token cost per turn was growing, not constant.
-
-    Called at the start of every chat() turn, before the new message is
-    added. If history is still short, this is a no-op (one cheap
-    get_state call). Once it's long: everything except the most recent
-    KEEP_LAST_N_MESSAGES is sent to the LLM for a short summary, that
-    summary is persisted to Supabase (conversation_summaries — the table
-    that's existed in the schema since the start but had no writer
-    until now), and the old messages are deleted from graph state via
-    RemoveMessage — not hidden from the prompt, actually removed from
-    what gets sent next turn.
+    Calls the match_knowledge_base Postgres function via RPC rather than
+    hand-writing the vector-search SQL here — keeps the similarity query
+    (and its index usage) defined once, in the schema, next to the table
+    and index it depends on.
     """
-    config = {"configurable": {"thread_id": thread_id}}
-    current_state = agent.get_state(config)
-    messages = current_state.values.get("messages", [])
-
-    if len(messages) <= SUMMARIZE_AFTER_N_MESSAGES:
-        return
-
-    to_summarize = messages[:-KEEP_LAST_N_MESSAGES]
-    to_keep = messages[-KEEP_LAST_N_MESSAGES:]
-
-    transcript = "\n".join(
-        f"{m.type}: {m.content}" for m in to_summarize if isinstance(m.content, str) and m.content
-    )
-    summary_prompt = (
-        "Summarize this astronomy-planning conversation in 3-5 sentences. "
-        "Keep any session_ids, locations, or equipment details mentioned "
-        "— they may be needed later. Be concise.\n\n" + transcript
-    )
-    summary = llm.invoke(summary_prompt).content
-
-    storage.save_conversation_summary(conversation_id, summary)
-
-    removals = [RemoveMessage(id=m.id) for m in to_summarize if m.id is not None]
-    summary_message = SystemMessage(content=f"[Earlier conversation summary]: {summary}")
-    agent.update_state(config, {"messages": removals + [summary_message]})
-
-
-def chat(user_message: str, user_name: str = "chat_user", thread_id: str = "default") -> str:
-    """
-    Runs one turn. thread_id identifies the conversation for LangGraph's
-    checkpointer (same thread_id = agent remembers prior turns).
-    user_name is resolved to a Supabase user_id HERE, from a real Python
-    argument — not from the LLM — and cached against thread_id so every
-    tool call and dynamic_prompt invocation in this thread can look up
-    "who is this" via RunnableConfig instead of asking the model to
-    infer or supply it.
-
-    Also persists both sides of the turn to Supabase (messages table) —
-    independent of LangGraph's own checkpointed state, so conversation
-    history survives even if MemorySaver's in-memory store is ever
-    swapped out or the process restarts.
-    """
-    if thread_id not in _thread_identity_cache:
-        user_id = storage.get_or_create_user(user_name)
-        _thread_identity_cache[thread_id] = {"user_id": user_id, "user_name": user_name}
-    user_id = _thread_identity_cache[thread_id]["user_id"]
-
-    conversation_id = storage.get_or_create_conversation(user_id, thread_id)
-    _summarize_and_trim(thread_id, conversation_id)
-
-    config = {"configurable": {"thread_id": thread_id}}
-    result = agent.invoke({"messages": [{"role": "user", "content": user_message}]}, config)
-    reply = result["messages"][-1].content
-
-    storage.save_message(conversation_id, "user", user_message)
-    storage.save_message(conversation_id, "assistant", reply)
-
-    return reply
-
-
-if __name__ == "__main__":
-    print(chat(
-        "Plan my observing session for tonight at latitude 33.2, longitude 32.4, "
-        "with an 8-inch (200mm) telescope, 1000mm focal length, beginner level.",
-        user_name="andrew",
-    ))
+    client = get_client()
+    result = client.rpc("match_knowledge_base", {
+        "query_embedding": query_embedding,
+        "match_count": match_count,
+    }).execute()
+    return result.data
