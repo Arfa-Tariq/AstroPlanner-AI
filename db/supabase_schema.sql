@@ -150,14 +150,15 @@ create table if not exists conversation_summaries (
 -- Semantic memory — astronomy knowledge base (pgvector)
 -- ---------------------------------------------------------------------
 
--- 1536 dims matches OpenAI text-embedding-3-small. If you embed with a
--- different model, change the dimension to match — pgvector requires a
--- fixed dimension per column.
+-- 384 dims matches sentence-transformers' all-MiniLM-L6-v2, run LOCALLY
+-- (no API key, no cost, no rate limit) rather than a paid embeddings API
+-- like OpenAI's. If you ever swap embedding models, this dimension must
+-- match exactly — pgvector requires a fixed dimension per column.
 create table if not exists knowledge_base (
     id uuid primary key default uuid_generate_v4(),
     content text not null,
     metadata jsonb,                     -- e.g. {"source": "messier_catalog", "object": "M31"}
-    embedding vector(1536),
+    embedding vector(384),
     created_at timestamptz not null default now()
 );
 
@@ -168,7 +169,7 @@ create index if not exists idx_knowledge_base_embedding
 -- writing a vector-search query — the search_knowledge_base tool will
 -- call this via supabase.rpc(...).
 create or replace function match_knowledge_base (
-    query_embedding vector(1536),
+    query_embedding vector(384),
     match_count int default 5
 )
 returns table (id uuid, content text, metadata jsonb, similarity float)
