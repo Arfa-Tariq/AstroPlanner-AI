@@ -30,7 +30,7 @@ from datetime import date
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage
 from langchain_groq import ChatGroq
-from langchain.agents import create_agent as create_react_agent
+from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
 import weather
