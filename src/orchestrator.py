@@ -67,16 +67,25 @@ def get_or_build_visibility_engine(latitude: float, longitude: float, aperture_m
     return _visibility_engine_cache[key]
 
 
-def _trim_schedule_for_chat(weekly_schedule: list, max_nights: int = 3) -> list:
+def _trim_schedule_for_chat(weekly_schedule: list, max_nights: int = 1) -> list:
     """
-    Schedules are already compact (a handful of timeline slots per
-    night), but a full 7-night schedule is still more than needed for a
-    typical chat answer. Trim to the first few nights — same reasoning
-    as the old _trim_visibility_for_chat: keep tool OUTPUT small so the
-    LLM's next turn doesn't pay to re-read a week of data it wasn't
-    asked about. Full data is always still in Supabase via session_id.
+    Schedules are already compact, but Groq's free tier caps requests at
+    12,000 tokens/minute — small enough that even 3 nights with prose
+    'note' fields can blow past it, especially once conversation history
+    accumulates across turns. Trimmed hard: 1 night, and the long-form
+    'note' string dropped from each slot (full data is always still in
+    Supabase via session_id — call get_session_context for it).
     """
-    return weekly_schedule[:max_nights]
+    trimmed = []
+    for night in weekly_schedule[:max_nights]:
+        def strip_note(slot):
+            return {k: v for k, v in slot.items() if k != "note"}
+        trimmed.append({
+            "date": night["date"],
+            "timeline": [strip_note(s) for s in night["timeline"]],
+            "daytime_bonus": [strip_note(s) for s in night["daytime_bonus"]],
+        })
+    return trimmed
 
 
 # ---------------------------------------------------------------------
