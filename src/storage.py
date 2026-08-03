@@ -84,6 +84,20 @@ def save_equipment(user_id: str, user: UserProfile, label: str = "default") -> s
     return created.data[0]["id"]
 
 
+def get_equipment(equipment_id: str) -> Optional[dict]:
+    """
+    Reads back one equipment snapshot — the raw row, not a UserProfile
+    (that reconstruction needs latitude/longitude too, which live on the
+    session, not the equipment row, so the caller assembles UserProfile
+    itself). Needed for session revisions: "run this again" should reuse
+    the exact telescope/camera the original session used, not ask the
+    user to re-enter specs.
+    """
+    client = get_client()
+    rows = client.table("equipment").select("*").eq("id", equipment_id).limit(1).execute()
+    return rows.data[0] if rows.data else None
+
+
 # ---------------------------------------------------------------------
 # Observation sessions
 # ---------------------------------------------------------------------
