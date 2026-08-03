@@ -30,6 +30,7 @@ from datetime import date
 
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
@@ -53,11 +54,15 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # needlessly re-download the NGC catalog.
 _visibility_engine_cache: dict = {}
 
-# thread_id -> user_id. A real app would resolve this from an auth
-# session; here chat() takes user_name explicitly and this dict is what
-# lets the dynamic_prompt callable (which only receives thread_id via
-# LangGraph's config) look up which user it's building context for.
-_thread_user_cache: dict[str, str] = {}
+# thread_id -> {"user_id": ..., "user_name": ...}. Identity is resolved
+# ONCE per thread_id inside chat() (from a real Python argument, not from
+# conversation text) and looked up here by tools/prompt via RunnableConfig
+# — never asked of the LLM. A tool parameter like `user_name` would force
+# the model to infer identity from the message text, which it can't do
+# reliably (nothing in "what have I planned recently?" says who "I" is),
+# and a wrong guess silently creates a phantom user in Supabase with zero
+# sessions. This is the fix for exactly that bug.
+_thread_identity_cache: dict[str, dict] = {}
 
 
 def get_or_build_visibility_engine(latitude: float, longitude: float, aperture_mm: float) -> VisibilityEngine:
@@ -94,7 +99,6 @@ def _trim_schedule_for_chat(weekly_schedule: list, max_nights: int = 1) -> list:
 
 @tool
 def create_observation_plan(
-    user_name: str,
     latitude: float,
     longitude: float,
     aperture_mm: float,
@@ -105,6 +109,7 @@ def create_observation_plan(
     pixel_size_um: float = None,
     bortle_scale: int = None,
     notes: str = None,
+    config: RunnableConfig = None,
 ) -> str:
     """Runs the full observation-planning pipeline (weather, visibility,
     recommendations, field-of-view, and a night-by-night schedule) for a
@@ -114,7 +119,14 @@ def create_observation_plan(
     from [location]". Ask for latitude/longitude and aperture_mm if not
     given — do not guess coordinates. sensor_* / pixel_size_um are only
     needed if the user has a camera for astrophotography; omit them for
-    visual-only observing."""
+    visual-only observing. Do NOT ask the user to identify themselves —
+    identity is resolved automatically."""
+    thread_id = config["configurable"]["thread_id"]
+    identity = _thread_identity_cache.get(thread_id)
+    if identity is None:
+        return "No user identity bound to this conversation — this is a setup bug, not something to ask the user about."
+    user_id, user_name = identity["user_id"], identity["user_name"]
+
     stub_camera = None
     if sensor_width_mm and sensor_height_mm and pixel_size_um:
         stub_camera = {
@@ -130,7 +142,6 @@ def create_observation_plan(
         camera=stub_camera,
     )
 
-    user_id = storage.get_or_create_user(user_name)
     equipment_id = storage.save_equipment(user_id, user)
     session_id = storage.create_session(
         user_id=user_id, latitude=latitude, longitude=longitude,
@@ -183,13 +194,16 @@ def get_session_context(session_id: str) -> str:
 
 
 @tool
-def get_recent_sessions(user_name: str, limit: int = 5) -> str:
-    """Lists a user's recent observation sessions (id, location, date,
-    revision number) without their full data. Use this to find a
+def get_recent_sessions(limit: int = 5, config: RunnableConfig = None) -> str:
+    """Lists the current user's recent observation sessions (id, location,
+    date, revision number) without their full data. Use this to find a
     session_id before calling get_session_context, or to answer
     "what have I planned recently" without loading everything."""
-    user_id = storage.get_or_create_user(user_name)
-    sessions = storage.list_recent_sessions(user_id, limit=limit)
+    thread_id = config["configurable"]["thread_id"]
+    identity = _thread_identity_cache.get(thread_id)
+    if identity is None:
+        return "No user identity bound to this conversation — this is a setup bug, not something to ask the user about."
+    sessions = storage.list_recent_sessions(identity["user_id"], limit=limit)
     if not sessions:
         return "No past sessions found for this user."
     return json.dumps(sessions, default=str)
@@ -213,7 +227,8 @@ def dynamic_prompt(state, config) -> list:
     implemented as a prompt function instead of a separate graph node.
     """
     thread_id = config.get("configurable", {}).get("thread_id")
-    user_id = _thread_user_cache.get(thread_id)
+    identity = _thread_identity_cache.get(thread_id)
+    user_id = identity["user_id"] if identity else None
 
     base = (
         "You are AstroPlanner, an astronomy observation planning assistant. "
@@ -251,12 +266,15 @@ def chat(user_message: str, user_name: str = "chat_user", thread_id: str = "defa
     """
     Runs one turn. thread_id identifies the conversation for LangGraph's
     checkpointer (same thread_id = agent remembers prior turns).
-    user_name resolves to a Supabase user_id, cached against thread_id so
-    dynamic_prompt (which only sees thread_id via config) can look up the
-    right user's recent sessions.
+    user_name is resolved to a Supabase user_id HERE, from a real Python
+    argument — not from the LLM — and cached against thread_id so every
+    tool call and dynamic_prompt invocation in this thread can look up
+    "who is this" via RunnableConfig instead of asking the model to
+    infer or supply it.
     """
-    if thread_id not in _thread_user_cache:
-        _thread_user_cache[thread_id] = storage.get_or_create_user(user_name)
+    if thread_id not in _thread_identity_cache:
+        user_id = storage.get_or_create_user(user_name)
+        _thread_identity_cache[thread_id] = {"user_id": user_id, "user_name": user_name}
 
     config = {"configurable": {"thread_id": thread_id}}
     result = agent.invoke({"messages": [{"role": "user", "content": user_message}]}, config)
