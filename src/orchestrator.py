@@ -34,7 +34,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
-
+from groq import BadRequestError
 # ---------------------------------------------------------------------
 # Checkpointer: Postgres (Supabase) if DATABASE_URL is set, else in-memory.
 #
@@ -161,12 +161,17 @@ def _run_pipeline(user: UserProfile, session_id: str) -> dict:
     existing one via parent_session_id, instead of duplicating the
     5-stage sequence. Returns the data needed for a trimmed chat reply.
     """
-    engine = get_or_build_visibility_engine(user.latitude, user.longitude, user.telescope.aperture_mm)
+   engine = get_or_build_visibility_engine(user.latitude, user.longitude, user.telescope.aperture_mm)
+   today = date.today()  # computed once, reused for both — matches the
+                           # notebooks' generated_at pattern; calling
+                           # date.today() independently for weather vs.
+                           # visibility risks a midnight rollover splitting
+                           # the two 7-day windows apart.
 
-    weekly_weather = weather.get_weekly_sky_conditions(user, date.today())
+    weekly_weather = weather.get_weekly_sky_conditions(user, today)
     storage.save_stage_result(session_id, "weather", weekly_weather)
 
-    weekly_visibility = engine.get_weekly_visibility(date.today())
+    weekly_visibility = engine.get_weekly_visibility(today)
     storage.save_stage_result(session_id, "visibility", weekly_visibility)
 
     weekly_recommendations = recommendation.get_weekly_recommendations(
@@ -181,7 +186,6 @@ def _run_pipeline(user: UserProfile, session_id: str) -> dict:
     storage.save_stage_result(session_id, "schedule", weekly_schedule)
 
     return {"setup_summary": setup_summary, "weekly_schedule": weekly_schedule}
-
 
 @tool
 def create_observation_plan(
@@ -236,6 +240,9 @@ def create_observation_plan(
         generated_at=date.today().isoformat(), equipment_id=equipment_id, notes=notes,
     )
 
+    conversation_id = storage.get_or_create_conversation(user_id, thread_id)
+    storage.set_conversation_session(conversation_id, session_id)
+   
     pipeline_result = _run_pipeline(user, session_id)
 
     # Groq's tool-message parser rejects content that isn't a non-empty
@@ -249,7 +256,50 @@ def create_observation_plan(
         "note": "Full 7-night data is saved under this session_id — call get_session_context for more.",
     }, default=str)
 
+@tool
+def regenerate_schedule(session_id: str, max_objects: int = 8, notes: str = None, config: RunnableConfig = None) -> str:
+    """Re-runs ONLY the scheduling stage for an existing session, reusing
+    its already-computed weather/visibility/recommendation/fov data rather
+    than re-running the full pipeline. Use this for requests that only
+    change scheduling constraints — e.g. "give me a 2-hour window instead",
+    "show me fewer targets", "only give me 4 objects tonight" — where the
+    underlying sky/weather data hasn't changed. Saves the result as a new
+    revision. Use revise_observation_plan instead if the user's location,
+    equipment, or date has actually changed."""
+    thread_id = config["configurable"]["thread_id"]
+    identity = _thread_identity_cache.get(thread_id)
+    if identity is None:
+        return "No user identity bound to this conversation — this is a setup bug, not something to ask the user about."
+    user_id = identity["user_id"]
 
+    parent = storage.get_full_session(session_id)
+    parent_meta = (parent or {}).get("session")
+    fov_result = (parent or {}).get("fov")
+    if not parent_meta or not fov_result:
+        return f"Session {session_id} is missing FoV data — cannot regenerate its schedule. Use create_observation_plan or revise_observation_plan instead."
+
+    new_session_id = storage.create_session(
+        user_id=user_id, latitude=parent_meta["latitude"], longitude=parent_meta["longitude"],
+        generated_at=parent_meta["generated_at"], equipment_id=parent_meta.get("equipment_id"),
+        notes=notes, parent_session_id=session_id,
+    )
+
+    # Reuse every prior stage's result as-is — only the schedule is recomputed.
+    for stage in ("weather", "visibility", "recommendation", "fov"):
+        prior = (parent or {}).get(stage)
+        if prior is not None:
+            storage.save_stage_result(new_session_id, stage, prior)
+
+    weekly_schedule = scheduler.get_weekly_schedule(fov_result["nights"], max_objects=max_objects)
+    storage.save_stage_result(new_session_id, "schedule", weekly_schedule)
+
+    return json.dumps({
+        "session_id": new_session_id,
+        "revision_of": session_id,
+        "schedule_preview": _trim_schedule_for_chat(weekly_schedule),
+        "note": "Schedule-only revision — weather/visibility/recommendations reused from the parent session unchanged.",
+    }, default=str)
+   
 @tool
 def revise_observation_plan(parent_session_id: str, notes: str = None, config: RunnableConfig = None) -> str:
     """Re-runs the observation-planning pipeline for the SAME location and
@@ -393,8 +443,10 @@ def search_knowledge_base(query: str, match_count: int = 3) -> str:
     use this for "why was X recommended in my plan" — that's
     get_session_context instead, since the answer depends on the user's
     actual saved data, not general knowledge."""
+    print(f"DEBUG: search_knowledge_base called with query='{query}'")  # remove once confirmed working
     query_embedding = knowledge.embed_text(query)
     results = storage.search_knowledge_base(query_embedding, match_count=match_count)
+    print(f"DEBUG: got {len(results) if results else 0} results")
     if not results:
         return "No relevant knowledge base entries found for this query."
     return json.dumps(results, default=str)
@@ -540,14 +592,44 @@ def chat(user_message: str, user_name: str = "chat_user", thread_id: str = "defa
     _summarize_and_trim(thread_id, conversation_id)
 
     config = {"configurable": {"thread_id": thread_id}}
-    result = agent.invoke({"messages": [{"role": "user", "content": user_message}]}, config)
-    reply = result["messages"][-1].content
+
+    reply = _invoke_with_retry(user_message, config, retries=1)
 
     storage.save_message(conversation_id, "user", user_message)
     storage.save_message(conversation_id, "assistant", reply)
 
     return reply
 
+def _invoke_with_retry(user_message: str, config: dict, retries: int = 1) -> str:
+    """
+    Groq's tool-call parser occasionally rejects the model's own malformed
+    tool-call syntax (e.g. 'get_recent_sessions [{"limit": 1}]' instead of
+    proper JSON args) — a model-side formatting slip, not a bug in our
+    tools. Retrying once with a fresh call usually gets a clean response;
+    if it fails twice, degrade to a message instead of propagating a raw
+    500-style error to the user.
+    """
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": user_message}]}, config
+            )
+            return result["messages"][-1].content
+        except BadRequestError as e:
+            last_error = e
+            print(f"WARNING: tool-call validation failed (attempt {attempt + 1}): {e}")
+            continue
+        except Exception as e:
+            last_error = e
+            print(f"WARNING: agent.invoke failed (attempt {attempt + 1}): {e}")
+            continue
+
+    return (
+        "Sorry — I hit an error trying to process that. Could you rephrase "
+        "your question, or try again? (If this keeps happening, it's "
+        f"likely a transient model issue, not your input. Details: {last_error})"
+    )
 
 if __name__ == "__main__":
     print(chat(
