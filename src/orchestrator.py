@@ -161,12 +161,12 @@ def _run_pipeline(user: UserProfile, session_id: str) -> dict:
     existing one via parent_session_id, instead of duplicating the
     5-stage sequence. Returns the data needed for a trimmed chat reply.
     """
-   engine = get_or_build_visibility_engine(user.latitude, user.longitude, user.telescope.aperture_mm)
-   today = date.today()  # computed once, reused for both — matches the
-                           # notebooks' generated_at pattern; calling
-                           # date.today() independently for weather vs.
-                           # visibility risks a midnight rollover splitting
-                           # the two 7-day windows apart.
+    engine = get_or_build_visibility_engine(user.latitude, user.longitude, user.telescope.aperture_mm)
+    today = date.today()  # computed once, reused for both — matches the
+                              # notebooks' generated_at pattern; calling
+                              # date.today() independently for weather vs.
+                              # visibility risks a midnight rollover splitting
+                              # the two 7-day windows apart.
 
     weekly_weather = weather.get_weekly_sky_conditions(user, today)
     storage.save_stage_result(session_id, "weather", weekly_weather)
