@@ -1,0 +1,29 @@
+# Core pipeline
+numpy
+pandas
+requests
+pydantic>=2
+
+# Astronomy stack (visibility.py / weather.py)
+astropy
+astroplan
+skyfield
+timezonefinder
+tzdata
+
+# Orchestrator (LangGraph + Groq)
+langchain-core
+langchain-groq
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary,pool]
+groq
+
+# Storage + semantic memory
+supabase
+sentence-transformers
+
+# API service
+fastapi
+uvicorn[standard]
+python-dotenv
