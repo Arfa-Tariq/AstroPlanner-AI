@@ -274,6 +274,13 @@ def get_latest_conversation_summary(conversation_id: str) -> Optional[str]:
     )
     return rows.data[0]["summary"] if rows.data else None
 
+def set_conversation_session(conversation_id: str, session_id: str) -> None:
+    """Links a conversation to the session it produced — called after
+    create_observation_plan/revise_observation_plan succeed, so later
+    queries can answer 'what conversation created this session' the
+    schema already supports but nothing was writing."""
+    client = get_client()
+    client.table("conversations").update({"session_id": session_id}).eq("id", conversation_id).execute()
 
 # ---------------------------------------------------------------------
 # Semantic memory (pgvector) — see db/supabase_schema.sql: match_knowledge_base
