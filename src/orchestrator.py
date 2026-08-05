@@ -98,7 +98,17 @@ from models import UserProfile
 import storage
 import knowledge
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.environ["GROQ_API_KEY"])
+# temperature=0.1 (not 0): near-deterministic tool selection — the main
+# reliability lever for "did it call the right tool at all" — while still
+# leaving _invoke_with_retry a real (if small) chance of getting a
+# differently-sampled, well-formed tool call on retry after a Groq
+# BadRequestError. temperature=0 would make retries pointless since the
+# same malformed call would just be regenerated identically.
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    api_key=os.environ["GROQ_API_KEY"],
+    temperature=0.1,
+)
 
 DATA_DIR = os.environ.get("ASTROPLANNER_DATA_DIR", "./data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -163,10 +173,10 @@ def _run_pipeline(user: UserProfile, session_id: str) -> dict:
     """
     engine = get_or_build_visibility_engine(user.latitude, user.longitude, user.telescope.aperture_mm)
     today = date.today()  # computed once, reused for both — matches the
-                              # notebooks' generated_at pattern; calling
-                              # date.today() independently for weather vs.
-                              # visibility risks a midnight rollover splitting
-                              # the two 7-day windows apart.
+                           # notebooks' generated_at pattern; calling
+                           # date.today() independently for weather vs.
+                           # visibility risks a midnight rollover splitting
+                           # the two 7-day windows apart.
 
     weekly_weather = weather.get_weekly_sky_conditions(user, today)
     storage.save_stage_result(session_id, "weather", weekly_weather)
@@ -485,8 +495,12 @@ def dynamic_prompt(state, config) -> list:
         "an existing plan, use revise_observation_plan instead, so it's "
         "saved as a linked revision rather than an unrelated new session. "
         "For general astronomy questions not about the user's own sessions "
-        "(e.g. \"what is the Orion Nebula\"), use search_knowledge_base "
-        "rather than answering from memory."
+        "(e.g. \"what is the Orion Nebula\"), you MUST call search_knowledge_base "
+        "before answering — do not answer from memory, and do not tell the "
+        "user 'no information was found' unless you actually called the "
+        "tool and it returned nothing. The same applies to session history: "
+        "call get_recent_sessions or get_session_context rather than "
+        "guessing or claiming you lack data you haven't actually looked up."
     )
 
     if user_id:
@@ -593,7 +607,11 @@ def chat(user_message: str, user_name: str = "chat_user", thread_id: str = "defa
 
     config = {"configurable": {"thread_id": thread_id}}
 
-    reply = _invoke_with_retry(user_message, config, retries=1)
+    # retries=2 (3 attempts total): bumped from 1 — with temperature=0.1
+    # each retry is a genuinely different sample, so a couple of extra
+    # shots meaningfully raises the odds of a well-formed tool call
+    # without materially hurting latency on the (rare) failure path.
+    reply = _invoke_with_retry(user_message, config, retries=2)
 
     storage.save_message(conversation_id, "user", user_message)
     storage.save_message(conversation_id, "assistant", reply)
