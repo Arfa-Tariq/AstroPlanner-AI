@@ -22,6 +22,19 @@ just diffing:
    matches the guide's own pipeline diagram, where "Pipeline Executes"
    is one block from the user's perspective. Narrower follow-up
    questions get their own tools instead of re-running everything.
+
+3. WEB SEARCH FALLBACK (Tavily): search_knowledge_base only covers a
+   small seeded astronomy knowledge base, and the session tools only
+   cover this user's own data. Anything outside both of those (current
+   events, general "what is X" questions the seed set doesn't have,
+   product questions, etc.) previously had no path except the model
+   guessing from its own training data. web_search is a deliberately
+   LAST-RESORT tool — the system prompt tells the model to try the
+   session tools and search_knowledge_base first, since those are
+   grounded in data this app actually owns, and only fall back to a
+   live web search when neither applies. It degrades gracefully to a
+   clear "not configured" message if TAVILY_API_KEY isn't set, rather
+   than crashing the whole agent.
 """
 
 import os
@@ -113,11 +126,30 @@ llm = ChatGroq(
 DATA_DIR = os.environ.get("ASTROPLANNER_DATA_DIR", "./data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Optional — web_search degrades to a clear "not configured" message
+# rather than raising if this isn't set, same pattern as DATABASE_URL
+# above. Get a key at https://tavily.com (free tier available).
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+
 # Caches — same "build once per conversation, not once per call" idea as
 # VisibilityEngine's own internal ephemeris/catalog caching. Keyed so
 # multiple users/locations in the same process don't collide or
 # needlessly re-download the NGC catalog.
 _visibility_engine_cache: dict = {}
+
+# Lazily created once, same "build once" principle as storage.get_client()
+# — avoids importing the tavily package at all (and avoids a client
+# construction cost) unless web_search is actually called.
+_tavily_client = None
+
+
+def get_tavily_client():
+    global _tavily_client
+    if _tavily_client is None:
+        from tavily import TavilyClient
+        _tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+    return _tavily_client
+
 
 # thread_id -> {"user_id": ..., "user_name": ...}. Identity is resolved
 # ONCE per thread_id inside chat() (from a real Python argument, not from
@@ -452,7 +484,8 @@ def search_knowledge_base(query: str, match_count: int = 3) -> str:
     knowledge rather than something from the user's own sessions. Do NOT
     use this for "why was X recommended in my plan" — that's
     get_session_context instead, since the answer depends on the user's
-    actual saved data, not general knowledge."""
+    actual saved data, not general knowledge. If this returns nothing
+    relevant, try web_search next rather than answering from memory."""
     print(f"DEBUG: search_knowledge_base called with query='{query}'")  # remove once confirmed working
     query_embedding = knowledge.embed_text(query)
     results = storage.search_knowledge_base(query_embedding, match_count=match_count)
@@ -462,10 +495,49 @@ def search_knowledge_base(query: str, match_count: int = 3) -> str:
     return json.dumps(results, default=str)
 
 
+@tool
+def web_search(query: str, max_results: int = 5) -> str:
+    """LAST-RESORT fallback live web search (via Tavily) for questions
+    this app has no other way to answer. Use this ONLY when BOTH of the
+    following are true: (1) the question is NOT about the user's own
+    observation sessions/equipment/schedule — use get_session_context /
+    get_recent_sessions for that instead, and (2) you already tried
+    search_knowledge_base for an astronomy question and it came back with
+    nothing relevant, OR the question isn't an astronomy topic at all
+    (e.g. current events, general "what is X", product comparisons).
+    Do NOT use this as a first resort, and do NOT use it for anything
+    about the user's own plans — those tools have the actual data, this
+    tool does not. When you use results from this tool, make clear to the
+    user that the answer came from a live web search rather than this
+    app's own curated data, since web results can be wrong or outdated."""
+    if not TAVILY_API_KEY:
+        return (
+            "Web search is not configured for this deployment (no TAVILY_API_KEY set) "
+            "— cannot fulfill this request. Tell the user you don't have a way to "
+            "search the web right now, rather than guessing an answer."
+        )
+    try:
+        client = get_tavily_client()
+        response = client.search(query, max_results=max_results)
+    except Exception as e:
+        return f"Web search failed ({e}). Tell the user the search failed rather than guessing an answer."
+
+    results = response.get("results", [])
+    if not results:
+        return "No web results found for this query."
+
+    formatted = [
+        {"title": r.get("title"), "url": r.get("url"), "content": r.get("content")}
+        for r in results
+    ]
+    return json.dumps(formatted, default=str)
+
+
 def build_tools() -> list:
     return [
-        create_observation_plan, revise_observation_plan,
+        create_observation_plan, revise_observation_plan, regenerate_schedule,
         get_session_context, get_recent_sessions, search_knowledge_base,
+        web_search,
     ]
 
 
@@ -494,13 +566,20 @@ def dynamic_prompt(state, config) -> list:
         "plan, use create_observation_plan. If they want to redo/regenerate "
         "an existing plan, use revise_observation_plan instead, so it's "
         "saved as a linked revision rather than an unrelated new session. "
-        "For general astronomy questions not about the user's own sessions "
-        "(e.g. \"what is the Orion Nebula\"), you MUST call search_knowledge_base "
-        "before answering — do not answer from memory, and do not tell the "
-        "user 'no information was found' unless you actually called the "
-        "tool and it returned nothing. The same applies to session history: "
-        "call get_recent_sessions or get_session_context rather than "
-        "guessing or claiming you lack data you haven't actually looked up."
+        "\n\n"
+        "For anything you don't already know how to answer, follow this "
+        "order rather than guessing from your own training data: "
+        "(1) if it's about the user's own plans, equipment, or schedule, "
+        "call get_recent_sessions or get_session_context — never guess or "
+        "claim you lack data you haven't actually looked up; "
+        "(2) if it's a general astronomy question, call "
+        "search_knowledge_base first; "
+        "(3) only if neither applies — or search_knowledge_base came back "
+        "empty — call web_search as a last resort, and tell the user the "
+        "answer came from a live web search rather than this app's own "
+        "data, since it can be wrong or outdated. Do not skip straight to "
+        "web_search for astronomy topics search_knowledge_base might cover, "
+        "and do not use web_search for the user's own session data."
     )
 
     if user_id:
