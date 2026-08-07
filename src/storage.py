@@ -190,14 +190,42 @@ def get_full_session(session_id: str) -> dict:
     """
     Everything known about one session: its metadata plus the latest
     result from every stage that has run so far. This is what a tool
-    like get_past_session_results hands back to the LLM — one call
-    instead of five.
+    like get_session_context hands back to the LLM — one call instead of
+    five.
+
+    FIX: .single() raises (PostgrestAPIError, HTTP 406) when zero rows
+    match, rather than returning an empty result — so a bad/unknown
+    session_id used to crash this function instead of letting callers
+    do their normal "no session found" handling. Every caller
+    (orchestrator.get_session_context, api.get_session, the CLI) already
+    checks `result.get("session")` and handles None correctly; this just
+    makes sure that path is actually reachable instead of raising first.
     """
     client = get_client()
-    session_row = client.table("observation_sessions").select("*").eq("id", session_id).single().execute()
+    try:
+        session_row = (
+            client.table("observation_sessions")
+            .select("*")
+            .eq("id", session_id)
+            .single()
+            .execute()
+        )
+        session_data = session_row.data
+    except Exception:
+        session_data = None
+
+    if not session_data:
+        return {
+            "session": None,
+            "weather": None,
+            "visibility": None,
+            "recommendation": None,
+            "fov": None,
+            "schedule": None,
+        }
 
     return {
-        "session": session_row.data,
+        "session": session_data,
         "weather": get_latest_stage_result(session_id, "weather"),
         "visibility": get_latest_stage_result(session_id, "visibility"),
         "recommendation": get_latest_stage_result(session_id, "recommendation"),
