@@ -19,6 +19,9 @@ langgraph-checkpoint-postgres
 psycopg[binary,pool]
 groq
 
+# Web search fallback (orchestrator.py's web_search tool)
+tavily-python
+
 # Storage + semantic memory
 supabase
 sentence-transformers
