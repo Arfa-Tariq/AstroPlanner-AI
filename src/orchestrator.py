@@ -35,6 +35,21 @@ just diffing:
    live web search when neither applies. It degrades gracefully to a
    clear "not configured" message if TAVILY_API_KEY isn't set, rather
    than crashing the whole agent.
+
+v2 fixes (this revision):
+
+4. create_observation_plan now accepts observing preferences (mode +
+   favorite target categories) and mount/telescope-type/camera-type
+   details. Those fields have been fully scored/consumed by
+   recommendation.py and modeled in models.py since v2, but the tool
+   signature never exposed them to the LLM — a chat user had no way to
+   say "I mostly image galaxies" or "I have a GoTo mount" and have it
+   affect anything. This wires them through.
+
+5. dynamic_prompt now gives explicit routing guidance for "what's
+   visible/observable tonight" style questions, which previously could
+   get misrouted to search_knowledge_base (general astronomy knowledge)
+   instead of get_session_context (the user's actual saved schedule).
 """
 
 import os
@@ -229,6 +244,46 @@ def _run_pipeline(user: UserProfile, session_id: str) -> dict:
 
     return {"setup_summary": setup_summary, "weekly_schedule": weekly_schedule}
 
+
+# Valid string values the LLM may pass for the new enum-backed params
+# below — kept as plain constants (not imported enums) purely so the
+# tool docstring can list them inline for the model without an extra
+# import-time dependency on models.py's enum members inside the
+# docstring string itself.
+_VALID_MODES = ("visual", "astrophotography")
+_VALID_TARGET_TYPES = (
+    "planet", "moon", "galaxy", "nebula",
+    "open_cluster", "globular_cluster", "double_star",
+)
+_VALID_MOUNT_TYPES = ("alt-az", "equatorial")
+_VALID_TELESCOPE_TYPES = ("refractor", "reflector", "catadioptric")
+_VALID_CAMERA_TYPES = ("dslr", "mirrorless", "dedicated_astro")
+
+
+def _build_preferences(mode: str = None, favorite_targets: list[str] = None) -> dict | None:
+    """Builds a Preferences dict from raw tool args, or None if the user
+    didn't give a mode (favorite_targets alone isn't enough — Preferences
+    requires mode). Silently drops any favorite_targets values that
+    aren't valid TargetType strings rather than raising, since this is
+    LLM-supplied input and a typo'd category shouldn't fail the whole
+    plan."""
+    if not mode:
+        return None
+    cleaned_targets = [t for t in (favorite_targets or []) if t in _VALID_TARGET_TYPES]
+    return {"mode": mode, "favorite_targets": cleaned_targets}
+
+
+def _build_mount(mount_type: str = None, goto_capable: bool = None, tracking: bool = None) -> dict | None:
+    """Mount requires type + goto_capable per MountSpec — if either is
+    missing, we don't have enough to build a valid MountSpec, so this
+    returns None (equipment is simply saved without mount info, same as
+    if the user never mentioned it) rather than raising a validation
+    error mid-conversation."""
+    if not mount_type or goto_capable is None:
+        return None
+    return {"type": mount_type, "goto_capable": goto_capable, "tracking": tracking}
+
+
 @tool
 def create_observation_plan(
     latitude: float,
@@ -241,6 +296,13 @@ def create_observation_plan(
     pixel_size_um: float = None,
     bortle_scale: int = None,
     notes: str = None,
+    telescope_type: str = None,
+    camera_type: str = None,
+    mode: str = None,
+    favorite_targets: list[str] = None,
+    mount_type: str = None,
+    mount_goto_capable: bool = None,
+    mount_tracking: bool = None,
     config: RunnableConfig = None,
 ) -> str:
     """Runs the full observation-planning pipeline (weather, visibility,
@@ -253,8 +315,28 @@ def create_observation_plan(
     targets"), use revise_observation_plan instead. Ask for
     latitude/longitude and aperture_mm if not given — do not guess
     coordinates. sensor_* / pixel_size_um are only needed for
-    astrophotography; omit them for visual-only observing. Do NOT ask the
-    user to identify themselves — identity is resolved automatically."""
+    astrophotography; omit them for visual-only observing.
+
+    Optional extra details that improve recommendations if the user
+    volunteers them (never ask for all of these up front — only capture
+    what the user actually mentions):
+    - telescope_type: one of 'refractor', 'reflector', 'catadioptric'.
+    - camera_type: one of 'dslr', 'mirrorless', 'dedicated_astro'
+      (only meaningful if sensor_* was also given).
+    - mode: 'visual' or 'astrophotography' — the user's primary use
+      case for this session.
+    - favorite_targets: list of target categories the user is most
+      interested in, from 'planet', 'moon', 'galaxy', 'nebula',
+      'open_cluster', 'globular_cluster', 'double_star'. Boosts matching
+      objects in the recommendations. Requires `mode` to also be set.
+    - mount_type: 'alt-az' or 'equatorial'.
+    - mount_goto_capable: whether the mount can auto-slew to a target.
+    - mount_tracking: whether the mount has motorized sidereal tracking
+      (independent of goto_capable). mount_type and mount_goto_capable
+      must both be given for mount info to be saved.
+
+    Do NOT ask the user to identify themselves — identity is resolved
+    automatically."""
     thread_id = config["configurable"]["thread_id"]
     identity = _thread_identity_cache.get(thread_id)
     if identity is None:
@@ -268,12 +350,20 @@ def create_observation_plan(
             "sensor_height_mm": sensor_height_mm,
             "pixel_size_um": pixel_size_um,
         }
+        if camera_type in _VALID_CAMERA_TYPES:
+            stub_camera["type"] = camera_type
+
+    stub_telescope = {"aperture_mm": aperture_mm, "focal_length_mm": focal_length_mm}
+    if telescope_type in _VALID_TELESCOPE_TYPES:
+        stub_telescope["type"] = telescope_type
 
     user = UserProfile(
         name=user_name, latitude=latitude, longitude=longitude,
         experience_level=experience_level, bortle_scale=bortle_scale,
-        telescope={"aperture_mm": aperture_mm, "focal_length_mm": focal_length_mm},
+        telescope=stub_telescope,
         camera=stub_camera,
+        mount=_build_mount(mount_type, mount_goto_capable, mount_tracking),
+        preferences=_build_preferences(mode, favorite_targets),
     )
 
     equipment_id = storage.save_equipment(user_id, user)
@@ -451,8 +541,12 @@ def get_session_context(session_id: str) -> str:
     per-night sky quality verdict and the top-scored recommended objects
     with their factor breakdown (visibility, weather, moon, equipment,
     light pollution). Use when the user asks about a specific past plan,
-    or asks "why" something was or wasn't recommended. Session ids are
-    listed in the system context — look there before asking the user."""
+    asks "why" something was or wasn't recommended, or asks what's
+    visible/observable "tonight" (use the most recent session_id from the
+    context list for that — do NOT use search_knowledge_base for
+    "tonight" questions, that tool is for general astronomy knowledge,
+    not the user's own schedule). Session ids are listed in the system
+    context — look there before asking the user."""
     result = storage.get_full_session(session_id)
     if not result or not result.get("session"):
         return f"No session found with id {session_id}."
@@ -482,10 +576,11 @@ def search_knowledge_base(query: str, match_count: int = 3) -> str:
     observation history. Use for questions like "tell me about the Orion
     Nebula" or "what does seeing mean", where the answer is astronomy
     knowledge rather than something from the user's own sessions. Do NOT
-    use this for "why was X recommended in my plan" — that's
-    get_session_context instead, since the answer depends on the user's
-    actual saved data, not general knowledge. If this returns nothing
-    relevant, try web_search next rather than answering from memory."""
+    use this for "why was X recommended in my plan" or "what's visible
+    tonight" — those are get_session_context instead, since the answer
+    depends on the user's actual saved data, not general knowledge. If
+    this returns nothing relevant for a genuinely general-knowledge
+    question, try web_search next rather than answering from memory."""
     print(f"DEBUG: search_knowledge_base called with query='{query}'")  # remove once confirmed working
     query_embedding = knowledge.embed_text(query)
     results = storage.search_knowledge_base(query_embedding, match_count=match_count)
@@ -567,19 +662,25 @@ def dynamic_prompt(state, config) -> list:
         "an existing plan, use revise_observation_plan instead, so it's "
         "saved as a linked revision rather than an unrelated new session. "
         "\n\n"
-        "For anything you don't already know how to answer, follow this "
-        "order rather than guessing from your own training data: "
-        "(1) if it's about the user's own plans, equipment, or schedule, "
-        "call get_recent_sessions or get_session_context — never guess or "
-        "claim you lack data you haven't actually looked up; "
-        "(2) if it's a general astronomy question, call "
-        "search_knowledge_base first; "
-        "(3) only if neither applies — or search_knowledge_base came back "
-        "empty — call web_search as a last resort, and tell the user the "
-        "answer came from a live web search rather than this app's own "
-        "data, since it can be wrong or outdated. Do not skip straight to "
-        "web_search for astronomy topics search_knowledge_base might cover, "
-        "and do not use web_search for the user's own session data."
+        "Routing rule of thumb — decide which BUCKET the question falls in "
+        "before picking a tool:\n"
+        "(A) About the user's OWN plan/schedule/equipment — this includes "
+        "'what's visible/observable tonight', 'what should I look at', "
+        "'why was X recommended', 'what's on my schedule'. These are "
+        "ALWAYS get_session_context (use the most recent session_id listed "
+        "below if the user doesn't name one) or get_recent_sessions. Never "
+        "use search_knowledge_base or web_search for these, even though "
+        "the words 'tonight' or 'visible' sound astronomy-ish — the answer "
+        "lives in this user's saved session data, not general knowledge.\n"
+        "(B) General astronomy knowledge with no dependency on the user's "
+        "own data — 'what is the Orion Nebula', 'what does seeing mean'. "
+        "Call search_knowledge_base first.\n"
+        "(C) Everything else (current events, non-astronomy topics, or "
+        "bucket B questions where search_knowledge_base came back empty) "
+        "— call web_search as a last resort, and tell the user the answer "
+        "came from a live web search rather than this app's own data, "
+        "since it can be wrong or outdated.\n"
+        "Never guess or claim you lack data you haven't actually looked up."
     )
 
     if user_id:
@@ -591,8 +692,9 @@ def dynamic_prompt(state, config) -> list:
                 for s in recent
             ]
             base += (
-                "\n\nThis user has these recent sessions (call get_session_context "
-                "only if the user asks about one — don't mention them unprompted):\n"
+                "\n\nThis user has these recent sessions, most recent first "
+                "(call get_session_context only if the user asks about their "
+                "plan/schedule/tonight — don't mention these unprompted):\n"
                 + "\n".join(lines)
             )
 
